@@ -1,0 +1,10 @@
+# 配置文件（含敏感信息，不要提交到 git）
+config.py
+
+# 日志和输出文件
+*.log
+*.csv
+
+# Python
+__pycache__/
+*.pyc
