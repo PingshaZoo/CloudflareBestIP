@@ -458,7 +458,7 @@ def fetch_colo_from_trace(ip, domain="la.pingshaisland.top", timeout=10):
         ctx = ssl.create_default_context()
         ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
         ssock = ctx.wrap_socket(sock, server_hostname=domain)
-        ssock.send(_build_request("GET", "/cdn-cgi/trace", domain, "close"))
+        ssock.send(f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\n\r\n".encode())
         data = b""
         while len(data) < 4096:
             chunk = ssock.recv(1024 * 128)
@@ -507,22 +507,41 @@ def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
     
 
 
-    # 3. 同一连接上获取 colo（轻量 trace 请求，不计入延迟测量）
-    try:
-        ssock.settimeout(timeout)
-        ssock.sendall(_build_request("GET", "/cdn-cgi/trace", domain, "keep-alive"))
-        trace_data = b""
-        while len(trace_data) < 4096:
-            chunk = ssock.recv(1024 * 128)
-            if not chunk: break
-            trace_data += chunk
-            if b"\r\n\r\n" in trace_data and b"colo=" in trace_data: break
-        for line in trace_data.decode(errors="ignore").splitlines():
-            if line.startswith("colo="):
-                res['colo'] = line.split("=", 1)[1].strip()
-                break
-    except Exception as e:
-        log("DEBUG", f"ip={ip} colo trace failed: {e}")  # 看实际发生了什么错误
+    # 3. 获取 colo：优先缓存，未命中时才发 /cdn-cgi/trace（不计入延迟测量）
+    with _colo_cache_lock:
+        cached_colo = _colo_cache.get(ip)
+    if cached_colo and cached_colo != "UNKNOWN":
+        res['colo'] = cached_colo
+    else:
+        try:
+            ssock.settimeout(3)
+            ssock.sendall(f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {domain}\r\nConnection: keep-alive\r\n\r\n".encode())
+        except Exception as e:
+            log("WARN", f"ip={ip} colo send failed: {e}")
+        else:
+            try:
+                trace_data = b""
+                while len(trace_data) < 4096:
+                    chunk = ssock.recv(1024 * 128)
+                    if not chunk: break
+                    trace_data += chunk
+                    if b"\r\n\r\n" in trace_data and b"colo=" in trace_data: break
+                if not trace_data:
+                    log("WARN", f"ip={ip} colo recv: connection closed before response")
+                else:
+                    found = False
+                    for line in trace_data.decode(errors="ignore").splitlines():
+                        if line.startswith("colo="):
+                            res['colo'] = line.split("=", 1)[1].strip()
+                            found = True
+                            break
+                    if not found:
+                        preview = trace_data[:500].decode(errors="ignore").replace("\r\n", "\\n")
+                        log("WARN", f"ip={ip} colo missing in response, body preview: {preview}")
+            except socket.timeout:
+                log("WARN", f"ip={ip} colo recv timeout")
+            except Exception as e:
+                log("WARN", f"ip={ip} colo recv failed: {e}")
 
     # 4. HTTP TTFB（测试文件）
     req = _build_request("GET", f"{test_path}?t={int(time.time())}", domain, "close",
@@ -572,15 +591,10 @@ def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
 
 # ================= HTTP 指纹 =================
 _HTTP_FINGERPRINT = (
-    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36\r\n"
+    "User-Agent:Chrome/128.0.0.0\r\n"
     "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8\r\n"
     "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8\r\n"
     "Accept-Encoding: gzip, deflate, br\r\n"
-    "Cache-Control: no-cache, no-store\r\n"
-    "Sec-Fetch-Dest: document\r\n"
-    "Sec-Fetch-Mode: navigate\r\n"
-    "Sec-Fetch-Site: none\r\n"
-    "Sec-Fetch-User: ?1\r\n"
 )
 
 def _build_request(method, path, host, connection, extra_headers=""):
@@ -620,8 +634,8 @@ def _probe_single_ip(real_ip, target):
                     with _colo_cache_lock:
                         _colo_cache[real_ip] = colo
                 if not colo:
-                    log("WARN", f"ip={real_ip} failed to get colo after successful probe_full_path for {ORIGIN_SNI}")
-                    return None
+                    log("WARN", f"ip={real_ip} colo is UNKNOWN after successful probe_full_path for {ORIGIN_SNI}")
+                    colo = "UNKNOWN"
                 http_ok += 1
                 tcp_ok += 1
                 tls_ok += 1
