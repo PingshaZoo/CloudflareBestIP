@@ -28,7 +28,7 @@ IP_SET_URLS = [                                  # Cloudflare IP 段数据源 UR
 ]
 
 # ================= 探测参数 =================
-SLEEP_INTERVAL = 300          # 单次探测间隔（毫秒）
+SLEEP_INTERVAL = 300          # 单次探测间隔（秒），300秒=5分钟
 TIMEOUT        = 7            # 单次探测超时（秒）
 PROBE_REPEAT   = 2            # 每个 IP 重复探测次数
 PROG_INTERVAL  = 10           # 进度日志间隔

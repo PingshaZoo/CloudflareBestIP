@@ -147,7 +147,7 @@ score = avg_lat * WEIGHT_LATENCY + http_loss * LOSS_PENALTY_MS * WEIGHT_LOSS
 |--------|------|
 | `PROBE_MODE` | `"full"` 全链路 或 `"edge"` 仅 colo |
 | `ORIGIN_VERIFY_CERT` | 是否验证 TLS 证书 |
-| `SLEEP_INTERVAL` | 探测间隔（毫秒） |
+| `SLEEP_INTERVAL` | 探测间隔（秒），默认 300 秒=5 分钟 |
 | `TIMEOUT` | 单次探测超时（秒） |
 | `PROBE_REPEAT` | 每个 IP 重复探测次数 |
 | `LOWEST_SPEED` | 最低速度阈值 KB/s |
