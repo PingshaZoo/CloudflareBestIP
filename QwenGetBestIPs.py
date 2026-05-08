@@ -521,8 +521,8 @@ def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
             if line.startswith("colo="):
                 res['colo'] = line.split("=", 1)[1].strip()
                 break
-    except Exception:
-        pass  # colo 获取失败不影响后续延迟测量
+    except Exception as e:
+        log("DEBUG", f"ip={ip} colo trace failed: {e}")  # 看实际发生了什么错误
 
     # 4. HTTP TTFB（测试文件）
     req = _build_request("GET", f"{test_path}?t={int(time.time())}", domain, "close",
