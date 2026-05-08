@@ -9,6 +9,65 @@
 | `QwenGetBestIPs.py` | 主探测脚本（纯 Python socket+SSL，跨平台，无外部依赖） |
 | `config.py` | 运行配置（含接口地址、探测参数、阿里云 DNS 密钥等） |
 | `config.example.py` | 配置模板（可提交 git，不含密钥） |
+| `GetBestDomains.bat` | Windows 一键启动批处理（可选，需自行修改路径） |
+
+## 首次运行指南
+
+### 1. 环境要求
+
+- Python 3.8+
+- 无需额外 pip 安装依赖（仅使用标准库 socket、ssl、json 等）
+- 如需同步阿里云 DNS，则需 `pip install alibabacloud_alidns20150109`
+
+### 2. 配置
+
+```bash
+cp config.example.py config.py   # 复制模板为正式配置
+```
+
+然后编辑 `config.py`，**必填项**：
+
+| 必须配置 | 说明 |
+|----------|------|
+| `ORIGIN_SNI_LIST` | 你的源站域名（SNI + Host），至少填一个 |
+| `ORIGIN_TEST_PATH` | 源站上的延迟测试文件路径，如 `/test.bin` |
+| `ORIGIN_SPEED_TEST_PATH` | 源站上的速度测试文件路径，如 `/test10MB.bin` |
+| `DOMAINS_SET_URL` | 域名列表 API 地址 |
+| `POST_URLS` | 探测结果上报地址，至少一个 |
+
+其余配置（探测参数、计分权重等）有默认值，可直接使用。
+
+### 3. 运行
+
+```bash
+# Linux / macOS / Windows 通用
+python QwenGetBestIPs.py
+
+# Windows 也可双击 GetBestDomains.bat（需先修改其中的 Python 和脚本路径）
+```
+
+### 4. 输出
+
+- 终端实时打印探测进度和最终 TOP 结果
+- 日志写入 `YYYYMMDD_cf_test.log`
+- 命中结果写入 `YYYYMMDD_cf_hits.csv`
+
+## 阿里云 DNS 同步（可选）
+
+**DNS 变更是一个可开关的附加功能，不配置完全不影响 Cloudflare IP 优选的核心结果。**
+
+核心流程 `拉取数据源 → 探测 → 评分 → 输出 TOP` 不依赖任何 DNS 配置。`send_to_aliyunDNS()` 只在 `CHANGE_DNS_RESOLVE = True` 时才执行。
+
+如需开启，额外配置以下项：
+
+| 配置项 | 说明 |
+|--------|------|
+| `CHANGE_DNS_RESOLVE` | 设为 `True` 开启 DNS 同步 |
+| `ALI_ACCESS_KEY_ID` | 阿里云 AccessKey ID |
+| `ALI_ACCESS_KEY_SECRET` | 阿里云 AccessKey Secret |
+| `ALI_DNS_TARGETS` | 要同步的域名列表 |
+
+默认 `CHANGE_DNS_RESOLVE = False`，即使不填任何阿里云配置也不会报错。
 
 ## 核心流程
 
@@ -70,24 +129,36 @@ score = avg_lat * WEIGHT_LATENCY + http_loss * LOSS_PENALTY_MS * WEIGHT_LOSS
 
 ### 配置速查
 
-所有运行配置集中在 `config.py`（从 `config.example.py` 复制后修改）：
+所有运行配置集中在 `config.py`（从 `config.example.py` 复制后修改）。
+
+**必填项：**
+
+| 配置项 | 说明 |
+|--------|------|
+| `ORIGIN_SNI_LIST` | 源站域名列表（SNI + Host） |
+| `ORIGIN_TEST_PATH` | 延迟测试文件路径 |
+| `ORIGIN_SPEED_TEST_PATH` | 速度测试文件路径（10MB） |
+| `DOMAINS_SET_URL` | 域名列表 API |
+| `POST_URLS` | 结果上报 URL 列表 |
+
+**可选调整：**
 
 | 配置项 | 说明 |
 |--------|------|
 | `PROBE_MODE` | `"full"` 全链路 或 `"edge"` 仅 colo |
-| `ORIGIN_SNI_LIST` | 源站域名列表（SNI + Host） |
-| `ORIGIN_TEST_PATH` | 延迟测试文件路径 |
-| `ORIGIN_SPEED_TEST_PATH` | 速度测试文件路径（10MB） |
 | `ORIGIN_VERIFY_CERT` | 是否验证 TLS 证书 |
 | `SLEEP_INTERVAL` | 探测间隔（毫秒） |
 | `TIMEOUT` | 单次探测超时（秒） |
 | `PROBE_REPEAT` | 每个 IP 重复探测次数 |
 | `LOWEST_SPEED` | 最低速度阈值 KB/s |
 | `WEIGHT_LATENCY / WEIGHT_LOSS / LOSS_PENALTY_MS` | 计分权重 |
-| `DOMAINS_SET_URL` | 域名列表 API |
 | `IP_SET_URLS` | IP 数据源 URL 列表 |
-| `POST_URLS` | 结果上报 URL 列表 |
-| `CHANGE_DNS_RESOLVE` | 是否更新阿里云 DNS |
+
+**阿里云 DNS（可选，不填不影响优选结果）：**
+
+| 配置项 | 说明 |
+|--------|------|
+| `CHANGE_DNS_RESOLVE` | `False` 关闭 / `True` 开启 |
 | `ALI_ACCESS_KEY_ID / ALI_ACCESS_KEY_SECRET` | 阿里云 AK/SK |
 | `ALI_DNS_TARGETS` | 要更新的域名列表 |
 
