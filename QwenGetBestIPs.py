@@ -30,6 +30,7 @@ from pathlib import Path
 # ================= 路径与文件 =================
 BASE_DIR = Path(__file__).resolve().parent
 def get_today():
+    """返回当前日期字符串，格式 YYYYMMDD，用于日志/CSV 文件名"""
     return datetime.now().strftime("%Y%m%d")
 LOG_FILE = BASE_DIR / f"{get_today()}_cf_test.log"
 HIT_FILE = BASE_DIR / f"{get_today()}_cf_hits.csv"
@@ -39,6 +40,7 @@ from config import *
 
 # ================= 平台检测 =================
 def detect_platform():
+    """检测当前运行平台：istoreos / windows / macos / linux"""
     if Path("/etc/openwrt_release").exists(): return "istoreos"
     s = sys.platform
     if s == "win32": return "windows"
@@ -118,6 +120,7 @@ REGION_ORDER = ["HONGKONG", "EastAsia", "SoutheastAsia", "NorthAmerica", "Europe
 
 # ================= curl 检测（仅用于数据源抓取）=================
 def _find_curl():
+    """查找系统中可用的 curl 可执行文件路径，找不到返回 None"""
     extra = [r"C:\Windows\System32\curl.exe", r"C:\Program Files\curl\bin\curl.exe"] if PLATFORM == "windows" else []
     for p in ["/usr/sbin/curl", "/usr/bin/curl", "/bin/curl", "/usr/local/bin/curl"] + extra:
         if os.path.isfile(p) and os.access(p, os.X_OK): return p
@@ -131,6 +134,7 @@ _done_lock = threading.Lock()
 _done_cnt  = [0]
 _fail_cnt  = [0]
 def log(level, msg):
+    """线程安全的日志输出：写入日志文件，INFO/ERROR/WARN/HIT/FINAL/PROG 级别同步打印到终端"""
     thread_name = threading.current_thread().name
     line = f"{time.strftime('%H:%M:%S')} [{level}] [{thread_name}] {msg}"
     with _log_lock:
@@ -144,6 +148,7 @@ def log(level, msg):
 
 # ================= HTTP 工具（数据源抓取用）=================
 def _http_get(url, timeout=15):
+    """HTTP GET 请求：优先 curl，失败回退 urllib；返回响应字节或 None"""
     if HAS_CURL:
         try:
             r = subprocess.run([CURL_BIN, "-sf", "--max-time", str(timeout), url], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout+3)
@@ -157,6 +162,7 @@ def _http_get(url, timeout=15):
         log("WARN", f"_http_get failed {url}: {e}"); return None
 
 def _http_post_file(url, payload_str, timeout=15):
+    """HTTP POST 上传 JSON 字符串：优先 curl 临时文件方式，失败回退 urllib；最多重试 10 次"""
     import tempfile
     import time
 
@@ -225,6 +231,7 @@ def _http_post_file(url, payload_str, timeout=15):
 
 # ================= 数据源获取 =================
 def fetch_domains(max_retry=5):
+    """从 DOMAINS_SET_URL 拉取域名列表，失败重试 max_retry 次，全部失败则退出进程"""
     for attempt in range(1, max_retry + 1):
         raw = _http_get(DOMAINS_SET_URL)
         if raw:
@@ -577,6 +584,7 @@ _HTTP_FINGERPRINT = (
 )
 
 def _build_request(method, path, host, connection, extra_headers=""):
+    """构造 HTTP/1.1 请求字节串，拼接 Chrome 128 指纹头"""
     return f"{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: {connection}\r\n{_HTTP_FINGERPRINT}{extra_headers}\r\n".encode()
 
 # ================= 探测调度与评分 =================
@@ -593,6 +601,7 @@ def _score(avg_lat, tcp_loss, tls_loss, http_loss):
     return avg_lat * WEIGHT_LATENCY + http_loss * LOSS_PENALTY_MS * WEIGHT_LOSS
 
 def _probe_single_ip(real_ip, target):
+    """对单个 IP 重复探测 PROBE_REPEAT 次，遍历所有 ORIGIN_SNI，返回评分结果字典；失败返回 None"""
     tcp_ok = tls_ok = http_ok = 0
     latencies = []
     eachProbeInfo = []
@@ -653,6 +662,7 @@ def _probe_single_ip(real_ip, target):
     }
 
 def probe_target_full(target):
+    """对单个目标（域名或 IP）进行全量探测：域名先 DNS 解析再逐个 IP 探测，返回结果列表"""
     if is_ip(target):
         ip_list = [target]
     else:
@@ -707,17 +717,20 @@ def worker(q, results, total, worker_name):
                 q.task_done()   # 无论成功、失败、None 哨兵，都调用一次 task_done
 
 def _dedup_by_best_score(results):
+    """按 real_ip 去重，同一 IP 多条记录时保留 score 最低的"""
     best = {}
     for r in results:
         if r["real_ip"] not in best or r["score"] < best[r["real_ip"]]["score"]: best[r["real_ip"]] = r
     return list(best.values())
 
 def select_top(results, n=TOP_N):
+    """去重后按 score 升序排列，返回前 n 条最优结果"""
     d = _dedup_by_best_score(results); d.sort(key=lambda x: x["score"])
     log("INFO", f"select_top: valid={len(results)} deduped={len(d)} picked={min(n, len(d))}")
     return d[:n]
 
 def top_region(results, region=None, colo=None, topN=5):
+    """按区域或 colo 筛选，返回去重后 score 最低的前 topN 条结果"""
     if not results: raise ValueError("results不能为空")
     if not colo and not region: raise ValueError("region 和 colo 必须至少填一个")
     f = _dedup_by_best_score(results)
@@ -727,15 +740,17 @@ def top_region(results, region=None, colo=None, topN=5):
     return f[:topN]
 
 def print_top_results(top):
+    """打印最终优选结果到日志和终端"""
     log("FINAL", "==== FINAL TOP ====")
     for r in top:
         log("FINAL", f'{r["real_ip"]} (from {r["target"]}) -> {r["colo"]} lat={r["lat"]}ms loss={r["loss"]} score={r["score"]}')
 
 def post_all_results(results):
+    """将探测结果转为 JSON 并并发 POST 到所有上报地址"""
     if not results: return
     nodes = [{"ip": r["real_ip"], "colo": r["colo"], "lat": r["lat"], "loss": r["loss"], "source": "" if is_ip(r["target"]) else r["target"]} for r in results]
     log("INFO", f"post_all_results: uploading {len(nodes)} nodes")
-    threads = [threading.Thread(target=_http_post_file, args=(u, json.dumps(nodes, ensure_ascii=False)), daemon=False) for u in POST_URLS]
+    threads = [threading.Thread(target=_http_post_file, args=(u, json.dumps(nodes, ensure_ascii=False, indent=4, sort_keys=True)), daemon=False) for u in POST_URLS]
     for t in threads: t.start()
     for t in threads: t.join()
 
@@ -795,7 +810,7 @@ def send_to_aliyunDNS(ip_list, domain, max_retry=ALI_DNS_MAX_RETRY):
             time.sleep(sleep_sec)
 
 def test_download_speed(test_list,lowest_speed=850,count=20):
-    """测试速度"""
+    """对优选 IP 做下载速度复测：用 10MB 测试文件测速，速度达标则更新 score/lat，累计 count 个达标即停止"""
     if not test_list :
         log("WARN", "No IPs to test_download_speed, skip")
         return
@@ -850,6 +865,7 @@ def _run_probe_phases(ip_list, results):
         t.join()
 
 def main():
+    """主入口：拉取数据源 → DNS 解析 → 多线程探测 → 速度复测 → 上报 → 可选同步阿里云 DNS"""
     # 启动前校验 full 模式配置
     if not ORIGIN_SNI_LIST or not ORIGIN_TEST_PATH:
         log("ERROR", "ORIGIN_SNI_LIST 和 ORIGIN_TEST_PATH 不能为空！请检查脚本顶部配置。")

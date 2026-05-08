@@ -10,14 +10,14 @@ def _today():
     return datetime.now().strftime("%Y%m%d")
 
 # ================= 接口地址 =================
-DOMAINS_SET_URL = "https://la.pingshaisland.top/api/domainsCT"
-POST_URLS = [
-    "https://pingshaisland.top/api/domains/dell",
-    "https://la.pingshaisland.top/api/domains/dell",
-    f"https://pingshaisland.top/api/domains/dell{_today()}",
-    f"https://la.pingshaisland.top/api/domains/dell{_today()}",
+DOMAINS_SET_URL = "https://abc.top/api/domainsCT"       # 域名列表 API 地址
+POST_URLS = [                                    # 探测结果上报地址列表
+    "https://abc.top/api/domains/dell",
+    "https://la.abc.top/api/domains/dell",
+    f"https://abc.top/api/domains/dell{_today()}",
+    f"https://la.abc.top/api/domains/dell{_today()}",
 ]
-IP_SET_URLS = [
+IP_SET_URLS = [                                  # Cloudflare IP 段数据源 URL 列表
     "https://www.wetest.vip/page/cloudflare/address_v4.html",
     "https://www.wetest.vip/page/cloudflare/total_v4.html",
     "https://www.wetest.vip/page/cloudflare/colo.html",
@@ -25,16 +25,6 @@ IP_SET_URLS = [
     "https://v2rayssr.com/cfip/",
     "https://api.4ce.cn/api/bestCFIP",
     "https://vps789.com/public/sum/cfIpApi",
-    "https://la.pingshaisland.top/api/domains/shayuan",
-    "https://la.pingshaisland.top/api/domains/dell",
-    "https://la.pingshaisland.top/api/domains/cgb",
-    "https://la.pingshaisland.top/api/domains/jujule",
-    "https://la.pingshaisland.top/api/domains/iphone",
-    "https://pingshaisland.top/api/domains/shayuan",
-    "https://pingshaisland.top/api/domains/dell",
-    "https://pingshaisland.top/api/domains/cgb",
-    "https://pingshaisland.top/api/domains/jujule",
-    "https://pingshaisland.top/api/domains/iphone",
 ]
 
 # ================= 探测参数 =================
@@ -46,15 +36,15 @@ TOP_N          = 10           # 最终输出 TOP N
 LOWEST_SPEED   = 500          # 最低速度 KB/s
 
 # ================= 计分权重 =================
-WEIGHT_LATENCY  = 1
-WEIGHT_LOSS     = 1
-LOSS_PENALTY_MS = 3000
+WEIGHT_LATENCY  = 1          # 延迟在评分中的权重
+WEIGHT_LOSS     = 1          # 丢包率在评分中的权重
+LOSS_PENALTY_MS = 3000       # 每 1% 丢包的惩罚毫秒数
 
 # ================= 探测模式与源站配置 =================
 PROBE_MODE = "full"                       # "edge" | "full"
 ORIGIN_SNI_LIST = [                       # 必填：真实源站域名（SNI+Host）
-    "la.pingshaisland.top",
-    "seattle.pingshaisland.top",
+    "la.abc.top",
+    "seattle.abc.top",
 ]
 ORIGIN_TEST_PATH      = "/test.bin"       # 必填：源站延迟测试文件路径
 ORIGIN_SPEED_TEST_PATH = "/test10MB.bin"  # 必填：源站速度测试文件路径
@@ -62,12 +52,12 @@ ORIGIN_VERIFY_CERT    = False             # 是否验证 TLS 证书
 
 # ================= 阿里云 DNS 配置 =================
 CHANGE_DNS_RESOLVE    = False             # 是否更新阿里云 DNS 解析
-ALI_ACCESS_KEY_ID     = "your-access-key-id"
-ALI_ACCESS_KEY_SECRET = "your-access-key-secret"
-ALI_DNS_ENDPOINT      = "alidns.cn-hangzhou.aliyuncs.com"
-ALI_DNS_TTL           = 605
-ALI_DNS_MAX_RETRY     = 20
-ALI_DNS_TARGETS = [
-    {"domain": "jujule.pingshaisland.top"},
-    {"domain": "shayuan.pingshaisland.top"},
+ALI_ACCESS_KEY_ID     = "your-access-key-id"                    # 阿里云 AccessKey ID
+ALI_ACCESS_KEY_SECRET = "your-access-key-secret"                # 阿里云 AccessKey Secret
+ALI_DNS_ENDPOINT      = "alidns.cn-hangzhou.aliyuncs.com"       # 阿里云 DNS API 端点
+ALI_DNS_TTL           = 605                                     # DNS A 记录 TTL（秒）
+ALI_DNS_MAX_RETRY     = 20                                      # 阿里云 DNS 更新最大重试次数
+ALI_DNS_TARGETS = [                                             # 要同步更新的域名列表（每项含 domain 字段）
+    {"domain": "jujule.abc.top"},
+    {"domain": "shayuan.abc.top"},
 ]
