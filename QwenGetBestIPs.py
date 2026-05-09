@@ -828,10 +828,9 @@ def test_download_speed(test_list,lowest_speed=850,count=20):
     if not test_list :
         log("WARN", "No IPs to test_download_speed, skip")
         return
-    list_to_test_speed = select_top(test_list,5*count)
     pass_cnt=0
 
-    for each in list_to_test_speed :
+    for each in test_list :
         test_download_speed_res = probe_full_path(each['real_ip'], ORIGIN_SNI_LIST[0], test_path=ORIGIN_SPEED_TEST_PATH, timeout=100)
         if not test_download_speed_res['success']:continue
         cost_time_ms = round(test_download_speed_res['tcp_ms']+test_download_speed_res['ttfb_ms'],1)
@@ -887,8 +886,6 @@ def main():
     log("INFO", f"mode={PROBE_MODE} SNI={ORIGIN_SNI_LIST} path={ORIGIN_TEST_PATH} verify={ORIGIN_VERIFY_CERT}")
 
 
-    #test_download_speed([{"real_ip":"172.64.146.211","ip": "172.64.146.211", "colo": "HKG", "lat": 102.4, "loss": 0.0, "source": "","score":9999999},])
-
     # 1. 并发获取域名列表和原始 IP 列表
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         future_domains = executor.submit(fetch_domains)
@@ -907,8 +904,9 @@ def main():
     # 4. 并发探测所有 IP
     results = []
     _run_probe_phases(all_ips,results)
-    test_download_speed_res = top_region(results, colo="HKG", topN=80)+top_region(results, region="NorthAmerica", topN=80)+top_region(results, region="EastAsia", topN=80) 
-    test_download_speed(test_download_speed_res,LOWEST_SPEED,30)
+    test_download_speed(top_region(results, region="NorthAmerica", topN=50),LOWEST_SPEED,10)
+    test_download_speed(top_region(results, colo="HKG", topN=50),LOWEST_SPEED,10)
+    test_download_speed(top_region(results, region="EastAsia", topN=50),LOWEST_SPEED,10)
     log("INFO", f"Total IPs probed={len(all_ips)} valid={len(results)} fail={_fail_cnt[0]}")
     post_all_results(select_top(results,1000))
     top_n_res = top_region(results, colo="HKG", topN=8)+top_region(results, region="NorthAmerica", topN=8)+top_region(results, region="EastAsia", topN=8) 
