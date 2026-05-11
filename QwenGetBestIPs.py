@@ -26,7 +26,9 @@ import ssl
 import concurrent.futures
 from datetime import datetime
 from pathlib import Path
-
+import ipaddress
+# ================= 配置导入 =================
+from config import *
 # ================= 路径与文件 =================
 BASE_DIR = Path(__file__).resolve().parent
 def get_today():
@@ -35,8 +37,7 @@ def get_today():
 LOG_FILE = BASE_DIR / f"{get_today()}_cf_test.log"
 HIT_FILE = BASE_DIR / f"{get_today()}_cf_hits.csv"
 
-# ================= 配置导入 =================
-from config import *
+
 
 # ================= 平台检测 =================
 def detect_platform():
@@ -133,6 +134,11 @@ _log_lock  = threading.Lock()
 _done_lock = threading.Lock()
 _done_cnt  = [0]
 _fail_cnt  = [0]
+
+# ================= 增量测速状态 =================
+_early_stop_flag = [False]  # 提前终止标志（线程安全列表）
+_speed_pass_count = [0]     # 速度达标累计数
+_batch_lock = threading.Lock()  # 批次测速锁
 def log(level, msg):
     """线程安全的日志输出：写入日志文件，INFO/ERROR/WARN/HIT/FINAL/PROG 级别同步打印到终端"""
     thread_name = threading.current_thread().name
@@ -253,8 +259,106 @@ def _fetch_single_url_ips(url):
     log("INFO", f"[wetest] {url} got={len(ips)}")
     return ips
 
+# ================= Cloudflare CIDR 过滤 =================
+_cf_ipv4_cidrs = None
+_cf_cidr_lock = threading.Lock()
+
+def fetch_cloudflare_cidrs():
+    """
+    获取 Cloudflare IPv4 CIDR 列表。
+    1. 内存缓存（已加载则直接返回）
+    2. API 请求
+    3. 失败则使用 config.CF_DEFAULT_IPV4_CIDRS
+    返回 ipaddress.IPv4Network 对象列表。
+    """
+    global _cf_ipv4_cidrs
+    with _cf_cidr_lock:
+        if _cf_ipv4_cidrs is not None:
+            return _cf_ipv4_cidrs
+
+    # 尝试调用官方 API，最多 3 次重试
+    for attempt in range(1, 4):
+        try:
+            raw = _http_get("https://api.cloudflare.com/client/v4/ips", timeout=15)
+            if not raw:
+                raise ValueError("Empty response")
+            data = json.loads(raw.decode())
+            if not data.get("success"):
+                raise ValueError(f"API error: {data.get('errors', [{}])[0].get('message', 'unknown')}")
+            cidr_list = data.get("result", {}).get("ipv4_cidrs", [])
+            if not cidr_list:
+                raise ValueError("No ipv4_cidrs in response")
+            _cf_ipv4_cidrs = [ipaddress.IPv4Network(cidr) for cidr in cidr_list]
+            log("INFO", f"Fetched {_cf_ipv4_cidrs.__len__()} Cloudflare IPv4 CIDR ranges from API")
+            return _cf_ipv4_cidrs
+        except Exception as e:
+            log("WARN", f"Fetch CF CIDRs attempt {attempt}/3 failed: {e}")
+            if attempt < 3:
+                time.sleep(2 ** attempt)
+
+    # API 全部失败，使用 config 中的默认 CIDR 配置
+    try:
+        default_cidrs = CF_DEFAULT_IPV4_CIDRS
+    except NameError:
+        default_cidrs = []
+
+    if default_cidrs:
+        try:
+            _cf_ipv4_cidrs = [ipaddress.IPv4Network(c) for c in default_cidrs]
+            log("WARN", f"Using {len(_cf_ipv4_cidrs)} default CF CIDRs from config (API failures)")
+            return _cf_ipv4_cidrs
+        except Exception as e:
+            log("ERROR", f"Parse default CF CIDRs failed: {e}")
+
+    log("WARN", "Using empty CF CIDR list - all IPs will pass filter")
+    return []
+
+def is_cf_ip(ip_str):
+    """
+    判断单个 IPv4 地址是否属于 Cloudflare 网段。
+    使用标准库 ipaddress 模块进行 CIDR 匹配。
+    如果 CF CIDRs 未加载（缓存为空），返回 True（容错模式）。
+    """
+    global _cf_ipv4_cidrs
+    if not _cf_ipv4_cidrs:
+        return True  # 无规则即不过滤
+    try:
+        ip = ipaddress.IPv4Address(ip_str)
+        return any(ip in cidr for cidr in _cf_ipv4_cidrs)
+    except ValueError:
+        return False  # 非法 IP 地址直接拒绝
+
+def filter_cf_ips(ips_list):
+    """
+    并发过滤 IP 列表，只保留 Cloudflare 网段的 IP。
+    使用线程池并行执行 is_cf_ip() 检查，线程数 = CPU 核数 * 2。
+    返回过滤后的 IP 列表。
+    """
+    if not ips_list:
+        return []
+
+    # 确保先加载 CIDR 规则（但不会阻塞太久）
+    fetch_cloudflare_cidrs()
+
+    max_workers = max(4, os.cpu_count() * 2)
+    filtered = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_ip = {executor.submit(is_cf_ip, ip): ip for ip in ips_list}
+        for future in concurrent.futures.as_completed(future_to_ip):
+            ip = future_to_ip[future]
+            try:
+                if future.result():
+                    filtered.append(ip)
+            except Exception:
+                pass  # 忽略单个 IP 的异常，不影响其他 IP
+
+    log("INFO", f"CF filter: {len(ips_list)} raw -> {len(filtered)} valid CF IPs")
+    return filtered
+
+# ================= DNS 解析 =================
 def fetch_wetest_ips():
-    """并发从所有 IP_SET_URLS 抓取 IPv4 地址"""
+    """并发从所有 IP_SET_URLS 抓取 IPv4 地址，并过滤非 Cloudflare 网段"""
     all_ips = set()
     urls = IP_SET_URLS + POST_URLS
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(urls), 30)) as executor:
@@ -266,8 +370,12 @@ def fetch_wetest_ips():
                 all_ips.update(ips)
             except Exception:
                 pass
-    ips = list(all_ips)
-    log("INFO", f"wetest TOTAL IP count={len(ips)}")
+    raw_ips = list(all_ips)
+
+    # 并发过滤：只保留 Cloudflare 官方 CIDR 范围内的 IP
+    ips = filter_cf_ips(raw_ips)
+
+    log("INFO", f"wetest TOTAL raw={len(raw_ips)}, cf_filtered={len(ips)}")
     return ips
 
 # ================= DNS 解析 =================
@@ -424,7 +532,7 @@ def resolve_remote_ip(domain):
 
 def resolve_domains_concurrent(domains, max_workers=None):
     """
-    并发解析域名列表，返回去重后的所有 IPv4 地址。
+    并发解析域名列表，返回去重后的所有 IPv4 地址（仅 Cloudflare 网段）。
     max_workers 默认使用全局 CONCURRENCY。
     """
     if max_workers is None:
@@ -440,12 +548,15 @@ def resolve_domains_concurrent(domains, max_workers=None):
                 ips = future.result()
                 if ips:
                     all_ips.update(ips)
-                else:dns_resolve_failed.add(domain);
+                else: dns_resolve_failed.add(domain)
             except Exception as e:
                 log("Error", f"DNS resolution failed.")
-    log("INFO", f"DNS resolution done, unique IPs count={len(all_ips)}")
+    raw_ip_list = list(all_ips)
+    # 并发过滤 DNS 解析结果，只保留 Cloudflare 官方 IP
+    filtered_ips = filter_cf_ips(raw_ip_list)
+    log("INFO", f"DNS resolution done, unique IPs: raw={len(raw_ip_list)}, cf_filtered={len(filtered_ips)}")
     log("INFO", f"DNS resolution done, dns resolve failed :  count={len(dns_resolve_failed)} , dns_resolve_failed:{dns_resolve_failed}")
-    return list(all_ips)
+    return filtered_ips
 
 
 # ================= 🔥 核心探测函数（纯Python原生） =================
@@ -709,6 +820,11 @@ def worker(q, results, total, worker_name):
                 log("INFO", f" received STOP signal, exiting")
                 break
 
+            # 检查是否已提前终止
+            if _early_stop_flag[0]:
+                q.task_done()
+                continue
+
             # 执行探测
             plist = probe_target_full(d)
 
@@ -823,34 +939,107 @@ def send_to_aliyunDNS(ip_list, domain, max_retry=ALI_DNS_MAX_RETRY):
             log("WARN", f"AliDNS retry in {sleep_sec}s...")
             time.sleep(sleep_sec)
 
-def test_download_speed(test_list,lowest_speed=850,count=20):
+def test_download_speed(test_list, lowest_speed=850, count=20):
     """对优选 IP 做下载速度复测：用 10MB 测试文件测速，速度达标则更新 score/lat，累计 count 个达标即停止"""
-    if not test_list :
+    if not test_list:
         log("WARN", "No IPs to test_download_speed, skip")
-        return
-    pass_cnt=0
+        return 0
+    pass_cnt = 0
 
-    for each in test_list :
+    for each in test_list:
         test_download_speed_res = probe_full_path(each['real_ip'], ORIGIN_SNI_LIST[0], test_path=ORIGIN_SPEED_TEST_PATH, timeout=100)
-        if not test_download_speed_res['success']:continue
-        cost_time_ms = round(test_download_speed_res['tcp_ms']+test_download_speed_res['ttfb_ms'],1)
-        download_speed = round((10*1024)/(cost_time_ms/1000),1)
-        each['download_speed'] = round(download_speed,1)
+        if not test_download_speed_res['success']:
+            continue
+        cost_time_ms = round(test_download_speed_res['tcp_ms'] + test_download_speed_res['ttfb_ms'], 1)
+        download_speed = round((10 * 1024) / (cost_time_ms / 1000), 1)
+        each['download_speed'] = round(download_speed, 1)
         each['download_cost_time'] = cost_time_ms
-        each['score'] = round(each['score'] - download_speed,1)
-        each['lat'] = round(each['lat'] - download_speed,1)
+        each['score'] = round(each['score'] - download_speed, 1)
+        each['lat'] = round(each['lat'] - download_speed, 1)
         log("INFO", f"colo={each['colo']}  ip={each['real_ip']}  download_speed={each['download_speed']}KB/S cost_time_ms={each['download_cost_time']} score={each['score']}")
-        if download_speed>lowest_speed:pass_cnt=pass_cnt+1
-        if pass_cnt>=count:return
+        if download_speed > lowest_speed:
+            pass_cnt += 1
+        if pass_cnt >= count:
+            break
+    return pass_cnt
 
+def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20):
+    """
+    增量批次测速：每完成 batch_size 个 IP 延迟测试后，从已完成的结果中选取三区域各 Top5 进行测速。
+    当全局速度达标数达到 target_pass_total 时设置提前终止标志。
+    返回本轮新增的达标数量。
+    """
+    # _speed_pass_count 和 _early_stop_flag 是列表类型，修改元素不需要 global 声明
+
+    if _early_stop_flag[0]:
+        return 0
+
+    with _batch_lock:
+        # 从当前结果中选取三区域各 Top5
+        try:
+            na_top = top_region(results, region="NorthAmerica", topN=5)
+            hk_top = top_region(results, colo="HKG", topN=5)
+            ea_top = top_region(results, region="EastAsia", topN=5)
+        except ValueError:
+            return 0  # 结果不足
+
+        # 合并去重（避免同一 IP 出现在多个区域被重复测速）
+        tested_ips = set()
+        batch_to_test = []
+        for r in na_top + hk_top + ea_top:
+            if r['real_ip'] not in tested_ips:
+                tested_ips.add(r['real_ip'])
+                batch_to_test.append(r)
+
+        if not batch_to_test:
+            return 0
+
+        log("INFO", f"=== Incremental batch speed test: {len(batch_to_test)} IPs ===")
+
+        # 对这批 IP 进行测速
+        local_pass = 0
+        for each in batch_to_test:
+            if _early_stop_flag[0]:
+                break
+
+            res = probe_full_path(each['real_ip'], ORIGIN_SNI_LIST[0], test_path=ORIGIN_SPEED_TEST_PATH, timeout=100)
+            if not res['success']:
+                continue
+
+            cost_time_ms = round(res['tcp_ms'] + res['ttfb_ms'], 1)
+            download_speed = round((10 * 1024) / (cost_time_ms / 1000), 1)
+
+            each['download_speed'] = round(download_speed, 1)
+            each['download_cost_time'] = cost_time_ms
+            each['score'] = round(each['score'] - download_speed, 1)
+            each['lat'] = round(each['lat'] - download_speed, 1)
+
+            log("INFO", f"BATCH colo={each['colo']} ip={each['real_ip']} download_speed={each['download_speed']}KB/S score={each['score']}")
+
+            if download_speed > LOWEST_SPEED:
+                local_pass += 1
+                _speed_pass_count[0] += 1
+                log("INFO", f"BATCH speed PASS: {_speed_pass_count[0]}/{target_pass_total}")
+
+        # 检查是否已达到总目标
+        if _speed_pass_count[0] >= target_pass_total:
+            _early_stop_flag[0] = True
+            log("INFO", f"=== Early stop triggered: {_speed_pass_count[0]} IPs passed speed test ===")
+
+        return local_pass
 
 
 def _run_probe_phases(ip_list, results):
-    """只探测 IP 列表，每个 IP 作为一个独立任务"""
+    """
+    只探测 IP 列表，每个 IP 作为一个独立任务。
+    每完成 100 个 IP 的延迟测试后，触发一次增量批次测速。
+    如果早停标志被设置，则不再投递剩余任务并提前结束。
+    """
     total = len(ip_list)
     if total == 0:
         log("WARN", "No IPs to probe, skip")
         return
+
     q = queue.Queue()
     workers = min(CONCURRENCY, total)
     ts = []
@@ -866,8 +1055,35 @@ def _run_probe_phases(ip_list, results):
         ts.append(t)
 
     log("INFO", f"==== Probing {total} IPs (workers={workers}) ====")
-    for ip in ip_list:
-        q.put(ip)
+
+    # 分批投递，每 100 个检查一次是否早停
+    batch_size = 100
+    idx = 0
+    last_batch_done = 0  # 上批次完成时的 _done_cnt 值
+
+    while idx < total:
+        if _early_stop_flag[0]:
+            log("INFO", "Early stop detected, stopping probe...")
+            break
+
+        # 投递一批
+        batch_end = min(idx + batch_size, total)
+        for i in range(idx, batch_end):
+            q.put(ip_list[i])
+
+        idx = batch_end
+
+        # 等待这批完成：通过检查 _done_cnt 直到达到预期值
+        expected_done = batch_end
+        while _done_cnt[0] < expected_done and not _early_stop_flag[0]:
+            time.sleep(0.1)
+
+        # 触发本批次的增量测速（只在有新完成的 IP 时）
+        if _done_cnt[0] > last_batch_done and len(results) > 0:
+            incremental_batch_speed_test(results, batch_size=batch_size, target_pass_total=20)
+            last_batch_done = _done_cnt[0]
+
+    # 等队列清空
     q.join()
     log("INFO", "==== Probing DONE ====")
 
@@ -887,7 +1103,7 @@ def main():
 
 
     # 1. 并发获取域名列表和原始 IP 列表
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         future_domains = executor.submit(fetch_domains)
         future_ips = executor.submit(fetch_wetest_ips)
         domains = list(dict.fromkeys(future_domains.result()))
@@ -901,12 +1117,9 @@ def main():
     all_ips = list(set(domain_ips+raw_ips))
     log("INFO", f"Final IPs to probe: {len(all_ips)}")
 
-    # 4. 并发探测所有 IP
+    # 4. 并发探测所有 IP（内置增量批次测速）
     results = []
-    _run_probe_phases(all_ips,results)
-    test_download_speed(top_region(results, region="NorthAmerica", topN=50),LOWEST_SPEED,10)
-    test_download_speed(top_region(results, colo="HKG", topN=50),LOWEST_SPEED,10)
-    test_download_speed(top_region(results, region="EastAsia", topN=50),LOWEST_SPEED,10)
+    _run_probe_phases(all_ips, results)
     log("INFO", f"Total IPs probed={len(all_ips)} valid={len(results)} fail={_fail_cnt[0]}")
     post_all_results(select_top(results,1000))
     top_n_res = top_region(results, colo="HKG", topN=8)+top_region(results, region="NorthAmerica", topN=8)+top_region(results, region="EastAsia", topN=8) 

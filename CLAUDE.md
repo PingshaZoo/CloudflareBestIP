@@ -72,7 +72,9 @@ python QwenGetBestIPs.py
 ## 核心流程
 
 ```
-拉取数据源(domains + IPs) → DNS解析域名 → 去重合并 → 多线程并发探测 → 评分排序 → 上报结果 → 可选同步阿里云DNS
+拉取数据源 (domains + IPs) -> DNS 解析域名 -> Cloudflare CIDR 过滤 -> 去重合并 -> 
+多线程并发探测 (每 100 个 IP 触发一次增量批次测速) -> 评分排序 -> 
+并发上报结果 -> 可选同步阿里云 DNS
 ```
 
 ## QwenGetBestIPs.py 架构
@@ -86,19 +88,25 @@ python QwenGetBestIPs.py
 
 ```
 main()
- ├─ fetch_domains() + fetch_wetest_ips()        ── 并行拉取
- ├─ resolve_domains_concurrent(domains)          ── 并发 DNS 解析
- ├─ _run_probe_phases(all_ips, results)          ── 多线程探测
- │   └─ worker() → probe_target_full()
- │       └─ resolve_remote_ip()                  ── DNS 解析链
- │       └─ _probe_single_ip()                   ── 单 IP 多次探测 + 打分
- │           ├─ [full] probe_full_path()          ── TCP+TLS+HTTP 全链路
- │           │   └─ 同连接获取 colo (trace请求)
- │           └─ [edge] fetch_colo_from_trace()    ── 仅 trace 测延迟+colo
- ├─ test_download_speed()                        ── 速度复测
- ├─ post_all_results()                           ── 结果上报
- └─ send_to_aliyunDNS()                          ── 更新 DNS
+ ├─ fetch_domains() + fetch_wetest_ips()                -- 并行拉取域名和 IP 数据源
+ ├─ resolve_domains_concurrent(domains)                 -- 并发 DNS 解析
+ ├─ filter_cf_ips(raw_ips)                              -- Cloudflare CIDR 过滤
+ ├─ _run_probe_phases(all_ips, results)                 -- 多线程探测
+ │   └─ worker() -> probe_target_full()
+ │       └─ resolve_remote_ip()                         -- DNS 解析链 (DoH->dig/nslookup)
+ │       └─ _probe_single_ip()                          -- 单 IP 多次探测 + 打分
+ │           ├─ [full] probe_full_path()                -- TCP+TLS+HTTP 全链路
+ │           │   ├─ colo 缓存 (_colo_cache)               -- 同 IP 只获取一次
+ │           │   └─ 速率检查 (每 50 次 recv 检测 LOWEST_SPEED)
+ │           └─ [edge] fetch_colo_from_trace()          -- 仅 trace 测延迟+colo
+ ├─ incremental_batch_speed_test()                      -- 增量批次测速 (三区域 Top5)
+ ├─ post_all_results()                                  -- 并发上报结果到多个 URL
+ └─ send_to_aliyunDNS()                                 -- 可选同步阿里云 DNS
 ```
+
+### HTTP 指纹
+
+所有出站 HTTP 请求统一使用 Chrome 128 指纹常量 `_HTTP_FINGERPRINT`，通过 `_build_request()` 组装请求头，提高伪装度绕过简单反爬。
 
 ### 评分公式
 
@@ -115,17 +123,23 @@ score = avg_lat * WEIGHT_LATENCY + http_loss * LOSS_PENALTY_MS * WEIGHT_LOSS
 ### DNS 解析链
 
 ```
-腾讯 DoH (doh.pub) → 阿里 DoH (dns.alidns.com) → dig@223.6.6.6 → nslookup@223.6.6.6
+腾讯 DoH (doh.pub) -> 阿里 DoH (dns.alidns.com) -> dig@223.6.6.6 -> nslookup@223.6.6.6
 ```
 所有方法过滤 Clash fake-ip 段 `198.18.x.x`。
 
+### Cloudflare CIDR 过滤
+
+脚本主动从 Cloudflare 官方 API (`https://api.cloudflare.com/client/v4/ips`) 下载 IPv4 CIDR 列表，对所有原始 IP 进行过滤，排除非官方网段的虚假 IP。失败时使用 `config.CF_DEFAULT_IPV4_CIDRS` 兜底。
+
 ### 已实现的优化
 
-- **并行数据源拉取**: `fetch_domains()` 和 `fetch_wetest_ips()` 并行执行；22 个 IP 源 URL 用 `ThreadPoolExecutor` 并发抓取
+- **并行数据源拉取**: `fetch_domains()` 和 `fetch_wetest_ips()` 并行执行；IP 源 URL 用 `ThreadPoolExecutor` 并发抓取
 - **colo 缓存**: full 模式下同 IP 只获取一次 colo，写入 `_colo_cache`（edge 模式不缓存，因为 trace 请求本身就是延迟测量）
 - **recv 缓冲区**: 128KB（与测试文件下载量匹配）
 - **HTTP 指纹**: 统一使用 Chrome 128 请求头常量 `_HTTP_FINGERPRINT`，通过 `_build_request()` 组装
 - **colo 与延迟同一连接**: `probe_full_path` 在 TLS 握手后先发 trace 拿 colo（keep-alive），再发测试文件请求（close），省掉一次 TCP+TLS
+- **增量批次测速**: 每完成 100 个 IP 延迟测试后，从三个区域（NorthAmerica/HKG/EastAsia）各取 Top5 进行 10MB 文件速度复测，累计达标 20 个即提前终止
+- **动态速率检查**: 下载测试文件时每 50 次 recv 检查当前速度，低于 `LOWEST_SPEED/4` 立即丢弃
 
 ### 配置速查
 
@@ -153,6 +167,7 @@ score = avg_lat * WEIGHT_LATENCY + http_loss * LOSS_PENALTY_MS * WEIGHT_LOSS
 | `LOWEST_SPEED` | 最低速度阈值 KB/s |
 | `WEIGHT_LATENCY / WEIGHT_LOSS / LOSS_PENALTY_MS` | 计分权重 |
 | `IP_SET_URLS` | IP 数据源 URL 列表 |
+| `CF_DEFAULT_IPV4_CIDRS` | Cloudflare 默认 CIDR 列表（API 失败时兜底） |
 
 **阿里云 DNS（可选，不填不影响优选结果）：**
 
@@ -178,5 +193,5 @@ score = avg_lat * WEIGHT_LATENCY + http_loss * LOSS_PENALTY_MS * WEIGHT_LOSS
 - 改配置项：编辑 `config.py`，新增配置需同步更新 `config.example.py`（脱敏版）
 - 改 `_HTTP_FINGERPRINT` 常量会影响所有出站请求的指纹
 - 改 `probe_full_path` 时注意测试文件下载的速率检查逻辑（每 50 个 recv 检查一次 `LOWEST_SPEED`）
-- 线程安全：`_colo_cache`、`_tested_ips`、`_done_cnt`、`_fail_cnt` 均有独立锁保护
+- 线程安全：`_colo_cache`、`_tested_ips`、`_done_cnt`、`_fail_cnt`、`_early_stop_flag`、`_speed_pass_count`、`_batch_lock` 均有独立锁保护
 - worker 线程的 `task_done()` 必须在 `finally` 块中调用，否则队列 join 死锁
