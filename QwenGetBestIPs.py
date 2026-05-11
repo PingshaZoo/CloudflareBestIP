@@ -48,7 +48,7 @@ def detect_platform():
     if s == "darwin": return "macos"
     return "linux"
 PLATFORM = detect_platform()
-CONCURRENCY = {"istoreos": 8, "windows": 10, "macos": 10, "linux": 10}.get(PLATFORM, 2)
+CONCURRENCY = {"istoreos": 8, "windows": 20, "macos": 10, "linux": 10}.get(PLATFORM, 20)
 
 # ================= 正则 =================
 IP_RE = re.compile(r'\b((?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?))\b')
@@ -358,8 +358,8 @@ def filter_cf_ips(ips_list):
 
 # ================= DNS 解析 =================
 def fetch_wetest_ips():
-    """并发从所有 IP_SET_URLS 抓取 IPv4 地址，并过滤非 Cloudflare 网段"""
-    all_ips = set()
+    """并发从所有 IP_SET_URLS 抓取 IPv4 地址，过滤非 Cloudflare 网段，返回 [(ip, source_url), ...]"""
+    ip_source = {}  # ip -> source_url
     urls = IP_SET_URLS + POST_URLS
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(urls), 30)) as executor:
         future_to_url = {executor.submit(_fetch_single_url_ips, u): u for u in urls}
@@ -367,16 +367,20 @@ def fetch_wetest_ips():
             url = future_to_url[future]
             try:
                 ips = future.result()
-                all_ips.update(ips)
+                for ip in ips:
+                    if ip not in ip_source:
+                        ip_source[ip] = url  # 记录首次出现的来源 URL
             except Exception:
                 pass
-    raw_ips = list(all_ips)
 
-    # 并发过滤：只保留 Cloudflare 官方 CIDR 范围内的 IP
-    ips = filter_cf_ips(raw_ips)
+    raw_ips = list(ip_source.keys())
+    filtered_ips = filter_cf_ips(raw_ips)
 
-    log("INFO", f"wetest TOTAL raw={len(raw_ips)}, cf_filtered={len(ips)}")
-    return ips
+    # 只保留过滤后的 IP，转换为 (ip, source_url) 列表
+    result = [(ip, ip_source[ip]) for ip in filtered_ips]
+
+    log("INFO", f"wetest TOTAL raw={len(raw_ips)}, cf_filtered={len(result)}")
+    return result
 
 # ================= DNS 解析 =================
 def is_ip(s):
@@ -532,7 +536,7 @@ def resolve_remote_ip(domain):
 
 def resolve_domains_concurrent(domains, max_workers=None):
     """
-    并发解析域名列表，返回去重后的所有 IPv4 地址（仅 Cloudflare 网段）。
+    并发解析域名列表，返回所有 IPv4 地址的 (ip, source_url) 列表（仅 Cloudflare 网段）。
     max_workers 默认使用全局 CONCURRENCY。
     """
     if max_workers is None:
@@ -556,7 +560,8 @@ def resolve_domains_concurrent(domains, max_workers=None):
     filtered_ips = filter_cf_ips(raw_ip_list)
     log("INFO", f"DNS resolution done, unique IPs: raw={len(raw_ip_list)}, cf_filtered={len(filtered_ips)}")
     log("INFO", f"DNS resolution done, dns resolve failed :  count={len(dns_resolve_failed)} , dns_resolve_failed:{dns_resolve_failed}")
-    return filtered_ips
+    # 所有解析出的 IP 来源统一标记为 DOMAINS_SET_URL
+    return [(ip, DOMAINS_SET_URL) for ip in filtered_ips]
 
 
 # ================= 🔥 核心探测函数（纯Python原生） =================
@@ -725,12 +730,15 @@ def _score(avg_lat, tcp_loss, tls_loss, http_loss):
     if tls_loss > 0.2: return 999999   # 3次中1次TLS失败重罚
     return avg_lat * WEIGHT_LATENCY + http_loss * LOSS_PENALTY_MS * WEIGHT_LOSS
 
-def _probe_single_ip(real_ip, target):
+def _probe_single_ip(real_ip, target, source_url=None):
     """对单个 IP 重复探测 PROBE_REPEAT 次，遍历所有 ORIGIN_SNI，返回评分结果字典；失败返回 None"""
     tcp_ok = tls_ok = http_ok = 0
     latencies = []
     eachProbeInfo = []
     colo = None
+    # 保存最后一次成功探测的分层耗时（用于上传）
+    last_tcp_ms = last_tls_ms = last_ttfb_ms = last_total_ms = 0
+
     for i in range(PROBE_REPEAT):
         for ORIGIN_SNI in ORIGIN_SNI_LIST:
             latency=None
@@ -753,6 +761,11 @@ def _probe_single_ip(real_ip, target):
                 latency = round(res['tcp_ms']+res['ttfb_ms'],1)
                 latencies.append(latency)
                 eachProbeInfo.append(colo+":"+str(latency)+"ms")
+                # 记录分层耗时
+                last_tcp_ms = res.get('tcp_ms', 0)
+                last_tls_ms = res.get('tls_ms', 0)
+                last_ttfb_ms = res.get('ttfb_ms', 0)
+                last_total_ms = res.get('total_ms', 0)
             else:
                 t0 = time.perf_counter()
                 colo = fetch_colo_from_trace(real_ip, ORIGIN_SNI)
@@ -778,15 +791,17 @@ def _probe_single_ip(real_ip, target):
         log("WARN", f"ip={real_ip} discarded: tcp_loss={tcp_loss} tls_loss={tls_loss} (score={score})")
 
     log("INFO", f'avg_lat={avg_lat}ms ip={real_ip} {eachProbeInfo}')
-    
+
     return {
         "target": target, "real_ip": real_ip, "colo": colo,
         "lat": round(avg_lat, 1), "loss": round(http_loss, 2),
         "tcp_loss": round(tcp_loss, 2), "tls_loss": round(tls_loss, 2), "http_loss": round(http_loss, 2),
-        "score": round(score, 2), "mode": PROBE_MODE
+        "score": round(score, 2), "mode": PROBE_MODE,
+        "tcp_ms": last_tcp_ms, "tls_ms": last_tls_ms, "ttfb_ms": last_ttfb_ms, "total_ms": last_total_ms,
+        "source_url": source_url or ""
     }
 
-def probe_target_full(target):
+def probe_target_full(target, source_url=None):
     """对单个目标（域名或 IP）进行全量探测：域名先 DNS 解析再逐个 IP 探测，返回结果列表"""
     if is_ip(target):
         ip_list = [target]
@@ -795,14 +810,14 @@ def probe_target_full(target):
         if not ip_list:
             log("WARN", f"probe_target_full: DNS resolution failed for {target}, skipping")
             return []
-    
+
     results = []
     for real_ip in ip_list:
         with _tested_ips_lock:
             if real_ip in _tested_ips: continue
             _tested_ips.add(real_ip)
-        
-        r = _probe_single_ip(real_ip, target)
+
+        r = _probe_single_ip(real_ip, target, source_url)
         if r:
             results.append(r)
     return results
@@ -825,15 +840,21 @@ def worker(q, results, total, worker_name):
                 q.task_done()
                 continue
 
+            # 任务可能是 (ip, source_url) 元组或单个 target
+            if isinstance(d, tuple) and len(d) == 2:
+                target, source_url = d
+            else:
+                target, source_url = d, None
+
             # 执行探测
-            plist = probe_target_full(d)
+            plist = probe_target_full(target, source_url)
 
             with _done_lock:
                 _done_cnt[0] += 1
                 done = _done_cnt[0]
                 if not plist:
                     _fail_cnt[0] += 1
-                    log("WARN", f"target={d} produced 0 valid results, fail={_fail_cnt[0]}")
+                    log("WARN", f"target={target} produced 0 valid results, fail={_fail_cnt[0]}")
                 for r in plist:
                     results.append(r)
                 if done % PROG_INTERVAL == 0 or done == total:
@@ -876,9 +897,22 @@ def print_top_results(top):
         log("FINAL", f'{r["real_ip"]} (from {r["target"]}) -> {r["colo"]} lat={r["lat"]}ms loss={r["loss"]} score={r["score"]}')
 
 def post_all_results(results):
-    """将探测结果转为 JSON 并并发 POST 到所有上报地址"""
+    """将探测结果转为 JSON 并并发 POST 到所有上报地址（含来源 URL、分层耗时、速度等完整字段）"""
     if not results: return
-    nodes = [{"ip": r["real_ip"], "colo": r["colo"], "lat": r["lat"], "loss": r["loss"], "source": "" if is_ip(r["target"]) else r["target"]} for r in results]
+    nodes = []
+    for r in results:
+        nodes.append({
+            "ip": r["real_ip"],
+            "colo": r.get("colo", ""),
+            "lat": r.get("lat", 0),
+            "loss": r.get("loss", 0),
+            "source": r.get("source_url", ""),
+            "speed_kb_s": r.get("download_speed", 0),
+            "tcp_ms": r.get("tcp_ms", 0),
+            "tls_ms": r.get("tls_ms", 0),
+            "ttfb_ms": r.get("ttfb_ms", 0),
+            "total_ms": r.get("total_ms", 0)
+        })
     log("INFO", f"post_all_results: uploading {len(nodes)} nodes")
     threads = [threading.Thread(target=_http_post_file, args=(u, json.dumps(nodes, ensure_ascii=False, indent=4, sort_keys=True)), daemon=False) for u in POST_URLS]
     for t in threads: t.start()
@@ -1029,13 +1063,13 @@ def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20):
         return local_pass
 
 
-def _run_probe_phases(ip_list, results):
+def _run_probe_phases(ip_source_list, results):
     """
-    只探测 IP 列表，每个 IP 作为一个独立任务。
+    只探测 IP 列表，每个 (ip, source_url) 作为一个独立任务。
     每完成 100 个 IP 的延迟测试后，触发一次增量批次测速。
     如果早停标志被设置，则不再投递剩余任务并提前结束。
     """
-    total = len(ip_list)
+    total = len(ip_source_list)
     if total == 0:
         log("WARN", "No IPs to probe, skip")
         return
@@ -1069,7 +1103,7 @@ def _run_probe_phases(ip_list, results):
         # 投递一批
         batch_end = min(idx + batch_size, total)
         for i in range(idx, batch_end):
-            q.put(ip_list[i])
+            q.put(ip_source_list[i])  # (ip, source_url) 元组
 
         idx = batch_end
 
@@ -1102,25 +1136,30 @@ def main():
     log("INFO", f"mode={PROBE_MODE} SNI={ORIGIN_SNI_LIST} path={ORIGIN_TEST_PATH} verify={ORIGIN_VERIFY_CERT}")
 
 
-    # 1. 并发获取域名列表和原始 IP 列表
+    # 1. 并发获取域名列表和原始 IP 列表（带来源 URL）
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         future_domains = executor.submit(fetch_domains)
         future_ips = executor.submit(fetch_wetest_ips)
         domains = list(dict.fromkeys(future_domains.result()))
-        raw_ips = list(dict.fromkeys(future_ips.result()))
-    log("INFO", f"Total domains={len(domains)}, raw_ips={len(raw_ips)}")
+        wetest_ip_sources = future_ips.result()  # [(ip, source_url), ...]
+    log("INFO", f"Total domains={len(domains)}, wetest IP sources={len(wetest_ip_sources)}")
 
-    # 2. 并发解析所有域名 → 得到域名解析出的 IP 列表
-    domain_ips = resolve_domains_concurrent(domains, max_workers=40)
+    # 2. 并发解析所有域名 → 得到域名解析出的 (ip, source_url) 列表
+    domain_ip_sources = resolve_domains_concurrent(domains, max_workers=40)
 
-    # 3. 合并去重：域名解析 IP + 原始 IP 列表
-    all_ips = list(set(domain_ips+raw_ips))
-    log("INFO", f"Final IPs to probe: {len(all_ips)}")
+    # 3. 合并去重：域名来源优先，IP_SET 来源补充
+    seen = set()
+    all_ip_sources = []
+    for ip, url in domain_ip_sources + wetest_ip_sources:
+        if ip not in seen:
+            seen.add(ip)
+            all_ip_sources.append((ip, url))
+    log("INFO", f"Final IPs to probe: {len(all_ip_sources)}")
 
     # 4. 并发探测所有 IP（内置增量批次测速）
     results = []
-    _run_probe_phases(all_ips, results)
-    log("INFO", f"Total IPs probed={len(all_ips)} valid={len(results)} fail={_fail_cnt[0]}")
+    _run_probe_phases(all_ip_sources, results)
+    log("INFO", f"Total IPs probed={len(all_ip_sources)} valid={len(results)} fail={_fail_cnt[0]}")
     post_all_results(select_top(results,1000))
     top_n_res = top_region(results, colo="HKG", topN=8)+top_region(results, region="NorthAmerica", topN=8)+top_region(results, region="EastAsia", topN=8) 
     top_n_res = select_top(top_n_res,10)
