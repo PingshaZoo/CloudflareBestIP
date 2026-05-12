@@ -664,19 +664,18 @@ def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
         t_speed_test_0 = time.perf_counter()
         data = first_byte + ssock.recv(1024 * 128)
         data_length = len(data)
-        test_when_5S= True
+        test_when_3S= True
         test_when_10S= True
-        test_when_20S= True
         while True:
             chunk = ssock.recv(1024*32)
             if not chunk: break
             data_length = data_length+len(chunk)
             # 5S 强制结束条件
-            if (time.perf_counter() - t_speed_test_0)>=5 and  test_when_5S :
-                test_when_5S = False
+            if (time.perf_counter() - t_speed_test_0)>=3 and  test_when_3S :
+                test_when_3S = False
                 now_speed = round((data_length / 1024) / (time.perf_counter() - t_speed_test_0), 1)
-                if now_speed < (LOWEST_SPEED*0.3):
-                    log("INFO", f"ip={ip} costTime={(time.perf_counter() - t_speed_test_0)}, speed={now_speed}KB/s < {LOWEST_SPEED*0.3}KB/s — discard!")
+                if now_speed < (LOWEST_SPEED*0.2):
+                    log("INFO", f"ip={ip} costTime={(time.perf_counter() - t_speed_test_0)}, speed={now_speed}KB/s < {LOWEST_SPEED*0.2}KB/s — discard!")
                     raise Exception(f"{ip} too slow")
             # 10S 强制结束条件
             if (time.perf_counter() - t_speed_test_0)>=10 and  test_when_10S :
@@ -684,14 +683,15 @@ def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
                 now_speed = round((data_length / 1024) / (time.perf_counter() - t_speed_test_0), 1)
                 if now_speed < (LOWEST_SPEED*0.5):
                     log("INFO", f"ip={ip} costTime={(time.perf_counter() - t_speed_test_0)}, speed={now_speed}KB/s < {LOWEST_SPEED*0.5}KB/s — discard!")
-                    break
-            # 20S 强制结束条件
-            if (time.perf_counter() - t_speed_test_0)>=20  and  test_when_10S:
-                test_when_10S = False
+                    raise Exception(f"{ip} too slow")
+            # 20S 强制结束
+            if (time.perf_counter() - t_speed_test_0)>=20:
                 now_speed = round((data_length / 1024) / (time.perf_counter() - t_speed_test_0), 1)
-                if now_speed < (LOWEST_SPEED):
-                    log("INFO", f"ip={ip} costTime={(time.perf_counter() - t_speed_test_0)}, speed={now_speed}KB/s < {LOWEST_SPEED}KB/s — discard!")
-                    break
+                log("INFO", f"ip={ip} costTime={(time.perf_counter() - t_speed_test_0)}, speed={now_speed}KB/s !")
+                break
+
+        download_time = time.perf_counter() - t_speed_test_0
+        res['download_speed'] = round((data_length / 1024) / download_time, 1) if download_time > 0 else 0
 
         status_line = data.split(b"\r\n")[0].decode(errors="ignore")
         res['ttfb_ms'] = round((time.perf_counter() - t0) * 1000, 1)
@@ -1046,11 +1046,10 @@ def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20, 
 
 def _full_batch_speed_test(results):
     """
-    全量速度复测：遍历 results 中所有未测速的 IP，逐个跑 ORIGIN_SPEED_TEST_PATH 速度测试。
-    与 incremental_batch_speed_test 的区别：
-    - 不抽样：全量遍历，不按区域选 Top
-    - 不限制区域：所有 IP 都测
-    - 不设置早停标志：纯测速
+    全量速度检查：遍历 results 中所有未测速的 IP。
+    probe_full_path 成功返回时已自动计算 download_speed，
+    所以绝大多数情况下本函数是空操作（跳过已有速度的 IP）。
+    仅在个别 edge case（如结果来自其他来源）下兜底补充。
     """
     untested = [r for r in results if r.get('download_speed', 0) == 0]
     if not untested:
