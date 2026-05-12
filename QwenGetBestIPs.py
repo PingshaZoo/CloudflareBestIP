@@ -690,9 +690,6 @@ def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
                 log("INFO", f"ip={ip} costTime={(time.perf_counter() - t_speed_test_0)}, speed={now_speed}KB/s !")
                 break
 
-        download_time = time.perf_counter() - t_speed_test_0
-        res['download_speed'] = round((data_length / 1024) / download_time, 1) if download_time > 0 else 0
-
         status_line = data.split(b"\r\n")[0].decode(errors="ignore")
         res['ttfb_ms'] = round((time.perf_counter() - t0) * 1000, 1)
         res['success'] = " 200 " in status_line or " 3" in status_line[:50]
@@ -1046,10 +1043,12 @@ def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20, 
 
 def _full_batch_speed_test(results):
     """
-    全量速度检查：遍历 results 中所有未测速的 IP。
-    probe_full_path 成功返回时已自动计算 download_speed，
-    所以绝大多数情况下本函数是空操作（跳过已有速度的 IP）。
-    仅在个别 edge case（如结果来自其他来源）下兜底补充。
+    全量速度复测：遍历 results 中所有 run probe_full_path 里的未测速的 IP，
+    逐个跑 ORIGIN_SPEED_TEST_PATH 速度测试。
+    与 incremental_batch_speed_test 的区别：
+    - 不抽样：全量遍历，不按区域选 Top
+    - 不限制区域：所有 IP 都测
+    - 不设置早停标志：纯测速
     """
     untested = [r for r in results if r.get('download_speed', 0) == 0]
     if not untested:
