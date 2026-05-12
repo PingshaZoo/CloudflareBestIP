@@ -670,7 +670,7 @@ def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
             if not chunk: break
             data_length = data_length+len(chunk)
             recv_time=recv_time+1
-            if (recv_time%8==0):
+            if (recv_time%32==0):
                 now_speed = round((data_length/1024)/(time.perf_counter() - t0), 1)
                 if now_speed<(LOWEST_SPEED/4):
                     log("INFO", f"ip={ip} recv_time ={recv_time},now_speed={now_speed}KB/S, less than {LOWEST_SPEED/4}KB/S! too slow! discard this!")
