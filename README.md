@@ -72,10 +72,19 @@ python QwenGetBestIPs.py
 ## 核心流程
 
 ```
-拉取数据源 (domains + IPs) -> DNS 解析域名 -> Cloudflare CIDR 过滤 -> 去重合并 -> 
+拉取数据源 (按优先级：HAVE_POST_RES -> IP_SET_URLS -> DOMAINS_SET_URL) -> 
+DNS 解析域名 -> Cloudflare CIDR 过滤 -> 去重合并 -> 
 多线程并发探测 (每 100 个 IP 触发一次增量批次测速) -> 评分排序 -> 
 并发上报结果 -> 可选同步阿里云 DNS
 ```
+
+### IP 优先级逻辑
+
+1. **Priority-1: `HAVE_POST_RES`** - 历史优结果（已测试数天的高质量 IP），按 `speed_kb_s` 降序排序，优先探测
+2. **Priority-2: `IP_SET_URLS`** - 第三方 IP 库（wetest.vip 等），正则提取 IP
+3. **Priority-3: `DOMAINS_SET_URL`** - 域名数据源，需 DNS 解析后才可探测
+
+合并时按优先级顺序去重：同一 IP 在多个数据源中出现时，保留优先级最高的来源。
 
 ## QwenGetBestIPs.py 架构
 
@@ -88,20 +97,22 @@ python QwenGetBestIPs.py
 
 ```
 main()
- ├─ fetch_domains() + fetch_wetest_ips()                -- 并行拉取域名和 IP 数据源
- ├─ resolve_domains_concurrent(domains)                 -- 并发 DNS 解析
- ├─ filter_cf_ips(raw_ips)                              -- Cloudflare CIDR 过滤
- ├─ _run_probe_phases(all_ips, results)                 -- 多线程探测
+ ├─ fetch_have_post_res()                         -- 获取历史优结果 (Priority-1)
+ ├─ fetch_wetest_ips()                            -- 获取第三方 IP 库 (Priority-2)
+ ├─ fetch_domains()                               -- 获取域名列表 (Priority-3)
+ ├─ resolve_domains_concurrent(domains)           -- 并发 DNS 解析
+ ├─ filter_cf_ips(raw_ips)                        -- Cloudflare CIDR 过滤
+ ├─ _run_probe_phases(all_ips, results)           -- 多线程探测 (按优先级顺序投递)
  │   └─ worker() -> probe_target_full()
- │       └─ resolve_remote_ip()                         -- DNS 解析链 (DoH->dig/nslookup)
- │       └─ _probe_single_ip()                          -- 单 IP 多次探测 + 打分
- │           ├─ [full] probe_full_path()                -- TCP+TLS+HTTP 全链路
- │           │   ├─ colo 缓存 (_colo_cache)               -- 同 IP 只获取一次
+ │       └─ resolve_remote_ip()                   -- DNS 解析链 (DoH->dig/nslookup)
+ │       └─ _probe_single_ip()                    -- 单 IP 多次探测 + 打分
+ │           ├─ [full] probe_full_path()          -- TCP+TLS+HTTP 全链路
+ │           │   ├─ colo 缓存 (_colo_cache)         -- 同 IP 只获取一次
  │           │   └─ 速率检查 (每 50 次 recv 检测 LOWEST_SPEED)
- │           └─ [edge] fetch_colo_from_trace()          -- 仅 trace 测延迟+colo
- ├─ incremental_batch_speed_test()                      -- 增量批次测速 (三区域 Top5)
- ├─ post_all_results()                                  -- 并发上报结果到多个 URL
- └─ send_to_aliyunDNS()                                 -- 可选同步阿里云 DNS
+ │           └─ [edge] fetch_colo_from_trace()    -- 仅 trace 测延迟+colo
+ ├─ incremental_batch_speed_test()                -- 增量批次测速 (三区域 Top5)
+ ├─ post_all_results()                            -- 并发上报结果到多个 URL
+ └─ send_to_aliyunDNS()                           -- 可选同步阿里云 DNS
 ```
 
 ### HTTP 指纹
@@ -133,6 +144,7 @@ score = avg_lat * WEIGHT_LATENCY + http_loss * LOSS_PENALTY_MS * WEIGHT_LOSS
 
 ### 已实现的优化
 
+- **IP 优先级探测**: 历史优结果 (`HAVE_POST_RES`) -> 第三方 IP 库 (`IP_SET_URLS`) -> 域名解析 IP (`DOMAINS_SET_URL`)，按优先级顺序投递，同一 IP 优先保留高质量来源
 - **并行数据源拉取**: `fetch_domains()` 和 `fetch_wetest_ips()` 并行执行；IP 源 URL 用 `ThreadPoolExecutor` 并发抓取
 - **colo 缓存**: full 模式下同 IP 只获取一次 colo，写入 `_colo_cache`（edge 模式不缓存，因为 trace 请求本身就是延迟测量）
 - **recv 缓冲区**: 128KB（与测试文件下载量匹配）
@@ -154,6 +166,7 @@ score = avg_lat * WEIGHT_LATENCY + http_loss * LOSS_PENALTY_MS * WEIGHT_LOSS
 | `ORIGIN_SPEED_TEST_PATH` | 速度测试文件路径（10MB） |
 | `DOMAINS_SET_URL` | 域名列表 API |
 | `POST_URLS` | 结果上报 URL 列表 |
+| `HAVE_POST_RES` | 历史优结果 API 列表（已测试的高质量 IP，优先级最高） |
 
 **可选调整：**
 
