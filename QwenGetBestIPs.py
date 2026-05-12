@@ -690,6 +690,10 @@ def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
                 log("INFO", f"ip={ip} costTime={(time.perf_counter() - t_speed_test_0)}, speed={now_speed}KB/s !")
                 break
 
+        # 记录实际下载速度（与 now_speed 同样计算公式：实际字节数 / 实际耗时）
+        download_time = time.perf_counter() - t_speed_test_0
+        res['download_speed'] = round((data_length / 1024) / download_time, 1) if download_time > 0 else 0
+
         status_line = data.split(b"\r\n")[0].decode(errors="ignore")
         res['ttfb_ms'] = round((time.perf_counter() - t0) * 1000, 1)
         res['success'] = " 200 " in status_line or " 3" in status_line[:50]
@@ -1020,11 +1024,10 @@ def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20, 
             if not res['success']:
                 continue
 
-            cost_time_ms = round(res['tcp_ms'] + res['ttfb_ms'], 1)
-            download_speed = round((10 * 1024) / (cost_time_ms / 1000), 1)
-
-            each['download_speed'] = round(download_speed, 1)
-            each['download_cost_time'] = cost_time_ms
+            # 用 probe_full_path 内部已计算的 download_speed（实际字节/实际耗时）
+            each['download_speed'] = res['download_speed']
+            each['download_cost_time'] = round(res['tcp_ms'] + res['ttfb_ms'], 1)
+            download_speed = each['download_speed']
 
             log("INFO", f"BATCH colo={each['colo']} ip={each['real_ip']} download_speed={each['download_speed']}KB/S lat={each['lat']}ms")
 
@@ -1043,39 +1046,36 @@ def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20, 
 
 def _full_batch_speed_test(results):
     """
-    全量速度复测：遍历 results 中所有 run probe_full_path 里的未测速的 IP，
-    逐个跑 ORIGIN_SPEED_TEST_PATH 速度测试。
+    全量速度复测：对所有 results 中的 IP，逐个跑 ORIGIN_SPEED_TEST_PATH 速度测试。
+    probe_full_path 内部已按实际字节/实际耗时算出 download_speed，直接取用。
     与 incremental_batch_speed_test 的区别：
     - 不抽样：全量遍历，不按区域选 Top
     - 不限制区域：所有 IP 都测
     - 不设置早停标志：纯测速
     """
-    untested = [r for r in results if r.get('download_speed', 0) == 0]
-    if not untested:
-        log("INFO", "_full_batch_speed_test: all IPs already speed-tested, skip")
+    if not results:
+        log("INFO", "_full_batch_speed_test: no results to test, skip")
         return 0
 
-    log("INFO", f"=== Full batch speed test: {len(untested)} IPs ===")
+    log("INFO", f"=== Full batch speed test: {len(results)} IPs ===")
     tested_count = 0
 
-    for each in untested:
+    for each in results:
         res = probe_full_path(each['real_ip'], ORIGIN_SNI_LIST[0],
                               test_path=ORIGIN_SPEED_TEST_PATH, timeout=100)
         if not res['success']:
             log("WARN", f"FULL SPEED {each['real_ip']} probe failed, skip")
             continue
 
-        cost_time_ms = round(res['tcp_ms'] + res['ttfb_ms'], 1)
-        download_speed = round((10 * 1024) / (cost_time_ms / 1000), 1)
-
-        each['download_speed'] = round(download_speed, 1)
-        each['download_cost_time'] = cost_time_ms
+        # 用 probe_full_path 内部已计算的 download_speed（实际字节/实际耗时）
+        each['download_speed'] = res['download_speed']
+        each['download_cost_time'] = round(res['tcp_ms'] + res['ttfb_ms'], 1)
         tested_count += 1
 
         log("INFO", f"FULL SPEED colo={each['colo']} ip={each['real_ip']} "
                      f"download_speed={each['download_speed']}KB/S lat={each['lat']}ms")
 
-    passed = sum(1 for r in untested if r.get('download_speed', 0) >= LOWEST_SPEED)
+    passed = sum(1 for r in results if r.get('download_speed', 0) >= LOWEST_SPEED)
     log("INFO", f"_full_batch_speed_test done: {tested_count} tested, {passed} passed (>= {LOWEST_SPEED}KB/s)")
     return tested_count
 
