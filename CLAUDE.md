@@ -121,12 +121,21 @@ main()
 
 ### 评分公式
 
+**第一阶段（延迟探测）：**
 ```python
 # 阈值惩罚级
 if tcp_loss > 0.2: return 999999   # TCP 失败率 >20% 直接淘汰
 if tls_loss > 0.2: return 999999   # TLS 失败率 >20% 直接淘汰
 # 综合评分（越低越好）
 score = avg_lat * WEIGHT_LATENCY + http_loss * LOSS_PENALTY_MS * WEIGHT_LOSS
+```
+
+**第二阶段（最终排名 `_rank_by_speed`）：**
+- 测速达标 (`download_speed >= LOWEST_SPEED`)：按速度降序排名，**第1名 score=1，第2名 score=2...**
+- 测速不达标 (`download_speed < LOWEST_SPEED`)：score = 9999 垫底
+- 未测速：保持第一阶段延迟+丢包 score 不变
+
+最终 `select_top` 按 score 升序选取，速度最快的 IP 天然排在第一位。
 ```
 
 延迟取 **去尾均值**（去掉最大值），样本数 ≥3 时才去尾，避免单样本变空列表。

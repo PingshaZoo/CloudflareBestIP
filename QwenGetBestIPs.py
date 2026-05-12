@@ -670,7 +670,7 @@ def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
             if not chunk: break
             data_length = data_length+len(chunk)
             recv_time=recv_time+1
-            if (recv_time%50==0):
+            if (recv_time%8==0):
                 now_speed = round((data_length/1024)/(time.perf_counter() - t0), 1)
                 if now_speed<(LOWEST_SPEED/4):
                     log("INFO", f"ip={ip} recv_time ={recv_time},now_speed={now_speed}KB/S, less than {LOWEST_SPEED/4}KB/S! too slow! discard this!")
@@ -890,10 +890,11 @@ def post_all_results(results):
     """将探测结果转为 JSON 并并发 POST 到所有上报地址（含来源 URL、分层耗时、速度等完整字段）"""
     if not results: return
     nodes = []
-    for r in results:
+    for r in sorted(results, key=lambda x: x.get("score", 999999)):
         nodes.append({
             "ip": r["real_ip"],
             "colo": r.get("colo", ""),
+            "score": r.get("score", 999999),
             "lat": r.get("lat", 0),
             "loss": r.get("loss", 0),
             "source": r.get("source_url", ""),
@@ -1011,7 +1012,6 @@ def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20):
 
             each['download_speed'] = round(download_speed, 1)
             each['download_cost_time'] = cost_time_ms
-            each['score'] = round(cost_time_ms, 2)  # 测速成绩决定评分
 
             log("INFO", f"BATCH colo={each['colo']} ip={each['real_ip']} download_speed={each['download_speed']}KB/S lat={each['lat']}ms")
 
@@ -1026,6 +1026,30 @@ def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20):
             log("INFO", f"=== Early stop triggered: {_speed_pass_count[0]} IPs passed speed test ===")
 
         return local_pass
+
+
+def _rank_by_speed(results):
+    """
+    最终速度排名：对已完成测速的 IP，按 download_speed 降序排名赋分。
+    - 测速达标 (>= LOWEST_SPEED)：score = 排名序号（1, 2, 3...）
+    - 测速不达标 (< LOWEST_SPEED)：score = 9999 垫底
+    - 未测速：保持原有的延迟+丢包 score 不变
+    """
+    speed_tested = [r for r in results if r.get('download_speed', 0) > 0]
+    if not speed_tested:
+        return
+
+    # 按 download_speed 降序排序
+    speed_tested.sort(key=lambda x: x['download_speed'], reverse=True)
+
+    for rank, r in enumerate(speed_tested, start=1):
+        if r['download_speed'] >= LOWEST_SPEED:
+            r['score'] = rank
+        else:
+            r['score'] = 9999
+
+    passed = sum(1 for r in speed_tested if r['score'] != 9999)
+    log("INFO", f"_rank_by_speed: {len(speed_tested)} tested, {passed} passed (>= {LOWEST_SPEED}KB/s), scored by speed rank")
 
 
 def _run_probe_phases(ip_source_list, results):
@@ -1092,6 +1116,9 @@ def _run_probe_phases(ip_source_list, results):
     for t in ts:
         t.join()
 
+    # 全部探测结束后，按速度排名赋最终分
+    _rank_by_speed(results)
+
 def main():
     """主入口：拉取数据源 → DNS 解析 → 多线程探测 → 速度复测 → 上报 → 可选同步阿里云 DNS"""
     # 启动前校验 full 模式配置
@@ -1148,8 +1175,8 @@ def main():
     # 5. 上报所有探测结果
     post_all_results(results)
 
-    # 6. 最终选优：只从已测速的 IP 中选取（speed_confirmed 列表）
-    speed_confirmed = [r for r in results if r.get('download_speed', 0) > 0]
+    # 6. 最终选优：只从测速达标的 IP 中按速度排名选取
+    speed_confirmed = [r for r in results if r.get('download_speed', 0) >= LOWEST_SPEED]
 
     if speed_confirmed:
         log("INFO", f"Final selection: {len(speed_confirmed)} IPs have completed speed test")
