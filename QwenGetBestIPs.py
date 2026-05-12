@@ -327,7 +327,7 @@ def filter_cf_ips(ips_list):
 def _fetch_have_post_res(url):
     """从单个 HAVE_POST_RES URL 获取历史优结果，返回 (ip, source_url, speed_kb_s) 列表"""
     try:
-        raw = _http_get(url, timeout=20)
+        raw = _http_get(url, timeout=5)
         if not raw:
             return []
         data = json.loads(raw.decode())
@@ -355,7 +355,7 @@ def fetch_have_post_res():
         log("INFO", "HAVE_POST_RES is empty, skip")
         return []
 
-    urls = list(set(HAVE_POST_RES))  # 去重
+    urls = list(set(HAVE_POST_RES+POST_URLS))  # 去重
     all_results = []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(urls), 20)) as executor:
@@ -383,7 +383,7 @@ def fetch_have_post_res():
 def fetch_wetest_ips():
     """并发从所有 IP_SET_URLS 抓取 IPv4 地址，过滤非 Cloudflare 网段，返回 [(ip, source_url), ...]"""
     ip_source = {}  # ip -> source_url
-    urls = IP_SET_URLS + POST_URLS
+    urls = IP_SET_URLS
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(urls), 30)) as executor:
         future_to_url = {executor.submit(_fetch_single_url_ips, u): u for u in urls}
         for future in concurrent.futures.as_completed(future_to_url):
@@ -661,22 +661,38 @@ def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
 
         first_byte = ssock.recv(1)  # TTFB 关键点
         if not first_byte: raise Exception("No response")
-
+        t_speed_test_0 = time.perf_counter()
         data = first_byte + ssock.recv(1024 * 128)
-        recv_time = 0
         data_length = len(data)
+        test_when_5S= True
+        test_when_10S= True
+        test_when_20S= True
         while True:
-            chunk = ssock.recv(1024*128)
+            chunk = ssock.recv(1024*32)
             if not chunk: break
             data_length = data_length+len(chunk)
-            recv_time=recv_time+1
-            if (recv_time%32==0):
-                now_speed = round((data_length/1024)/(time.perf_counter() - t0), 1)
-                if now_speed<(LOWEST_SPEED/4):
-                    log("INFO", f"ip={ip} recv_time ={recv_time},now_speed={now_speed}KB/S, less than {LOWEST_SPEED/4}KB/S! too slow! discard this!")
-                    raise Exception("too slow!discard this!")
+            # 5S 强制结束条件
+            if (time.perf_counter() - t_speed_test_0)>=5 and  test_when_5S :
+                test_when_5S = False
+                now_speed = round((data_length / 1024) / (time.perf_counter() - t_speed_test_0), 1)
+                if now_speed < (LOWEST_SPEED*0.3):
+                    log("INFO", f"ip={ip} costTime={(time.perf_counter() - t_speed_test_0)}, speed={now_speed}KB/s < {LOWEST_SPEED*0.3}KB/s — discard!")
+                    raise Exception(f"{ip} too slow")
+            # 10S 强制结束条件
+            if (time.perf_counter() - t_speed_test_0)>=10 and  test_when_10S :
+                test_when_10S = False
+                now_speed = round((data_length / 1024) / (time.perf_counter() - t_speed_test_0), 1)
+                if now_speed < (LOWEST_SPEED*0.5):
+                    log("INFO", f"ip={ip} costTime={(time.perf_counter() - t_speed_test_0)}, speed={now_speed}KB/s < {LOWEST_SPEED*0.5}KB/s — discard!")
+                    break
+            # 20S 强制结束条件
+            if (time.perf_counter() - t_speed_test_0)>=20  and  test_when_10S:
+                test_when_10S = False
+                now_speed = round((data_length / 1024) / (time.perf_counter() - t_speed_test_0), 1)
+                if now_speed < (LOWEST_SPEED):
+                    log("INFO", f"ip={ip} costTime={(time.perf_counter() - t_speed_test_0)}, speed={now_speed}KB/s < {LOWEST_SPEED}KB/s — discard!")
+                    break
 
-        
         status_line = data.split(b"\r\n")[0].decode(errors="ignore")
         res['ttfb_ms'] = round((time.perf_counter() - t0) * 1000, 1)
         res['success'] = " 200 " in status_line or " 3" in status_line[:50]
@@ -810,7 +826,7 @@ def probe_target_full(target, source_url=None):
             results.append(r)
     return results
 
-def worker(q, results, total, worker_name):
+def worker(q, results, total, worker_name, allow_early_stop=True):
     """工作线程：从队列取任务探测，保证 task_done() 必定被调用"""
     threading.current_thread().name = worker_name   # 显式命名
     while True:
@@ -823,8 +839,8 @@ def worker(q, results, total, worker_name):
                 log("INFO", f" received STOP signal, exiting")
                 break
 
-            # 检查是否已提前终止
-            if _early_stop_flag[0]:
+            # 检查是否已提前终止（仅当 allow_early_stop=True 时检查）
+            if allow_early_stop and _early_stop_flag[0]:
                 q.task_done()
                 continue
 
@@ -964,15 +980,15 @@ def send_to_aliyunDNS(ip_list, domain, max_retry=ALI_DNS_MAX_RETRY):
             log("WARN", f"AliDNS retry in {sleep_sec}s...")
             time.sleep(sleep_sec)
 
-def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20):
+def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20, allow_early_stop=True):
     """
     增量批次测速：每完成 batch_size 个 IP 延迟测试后，从已完成的结果中选取三区域各 Top5 进行测速。
-    当全局速度达标数达到 target_pass_total 时设置提前终止标志。
+    当全局速度达标数达到 target_pass_total 时设置提前终止标志（仅 allow_early_stop=True 时）。
     返回本轮新增的达标数量。
     """
     # _speed_pass_count 和 _early_stop_flag 是列表类型，修改元素不需要 global 声明
 
-    if _early_stop_flag[0]:
+    if allow_early_stop and _early_stop_flag[0]:
         return 0
 
     with _batch_lock:
@@ -1020,12 +1036,50 @@ def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20):
                 _speed_pass_count[0] += 1
                 log("INFO", f"BATCH speed PASS: {_speed_pass_count[0]}/{target_pass_total}")
 
-        # 检查是否已达到总目标
-        if _speed_pass_count[0] >= target_pass_total:
+        # 检查是否已达到总目标（仅 allow_early_stop=True 时设置早停标志）
+        if allow_early_stop and _speed_pass_count[0] >= target_pass_total:
             _early_stop_flag[0] = True
             log("INFO", f"=== Early stop triggered: {_speed_pass_count[0]} IPs passed speed test ===")
 
         return local_pass
+
+
+def _full_batch_speed_test(results):
+    """
+    全量速度复测：遍历 results 中所有未测速的 IP，逐个跑 ORIGIN_SPEED_TEST_PATH 速度测试。
+    与 incremental_batch_speed_test 的区别：
+    - 不抽样：全量遍历，不按区域选 Top
+    - 不限制区域：所有 IP 都测
+    - 不设置早停标志：纯测速
+    """
+    untested = [r for r in results if r.get('download_speed', 0) == 0]
+    if not untested:
+        log("INFO", "_full_batch_speed_test: all IPs already speed-tested, skip")
+        return 0
+
+    log("INFO", f"=== Full batch speed test: {len(untested)} IPs ===")
+    tested_count = 0
+
+    for each in untested:
+        res = probe_full_path(each['real_ip'], ORIGIN_SNI_LIST[0],
+                              test_path=ORIGIN_SPEED_TEST_PATH, timeout=100)
+        if not res['success']:
+            log("WARN", f"FULL SPEED {each['real_ip']} probe failed, skip")
+            continue
+
+        cost_time_ms = round(res['tcp_ms'] + res['ttfb_ms'], 1)
+        download_speed = round((10 * 1024) / (cost_time_ms / 1000), 1)
+
+        each['download_speed'] = round(download_speed, 1)
+        each['download_cost_time'] = cost_time_ms
+        tested_count += 1
+
+        log("INFO", f"FULL SPEED colo={each['colo']} ip={each['real_ip']} "
+                     f"download_speed={each['download_speed']}KB/S lat={each['lat']}ms")
+
+    passed = sum(1 for r in untested if r.get('download_speed', 0) >= LOWEST_SPEED)
+    log("INFO", f"_full_batch_speed_test done: {tested_count} tested, {passed} passed (>= {LOWEST_SPEED}KB/s)")
+    return tested_count
 
 
 def _rank_by_speed(results):
@@ -1052,11 +1106,11 @@ def _rank_by_speed(results):
     log("INFO", f"_rank_by_speed: {len(speed_tested)} tested, {passed} passed (>= {LOWEST_SPEED}KB/s), scored by speed rank")
 
 
-def _run_probe_phases(ip_source_list, results):
+def _run_probe_phases(ip_source_list, results, allow_early_stop=True):
     """
     只探测 IP 列表，每个 (ip, source_url) 作为一个独立任务。
     每完成 100 个 IP 的延迟测试后，触发一次增量批次测速。
-    如果早停标志被设置，则不再投递剩余任务并提前结束。
+    如果早停标志被设置（且 allow_early_stop=True），则不再投递剩余任务并提前结束。
     """
     total = len(ip_source_list)
     if total == 0:
@@ -1070,7 +1124,7 @@ def _run_probe_phases(ip_source_list, results):
         name = f"Worker-{i+1}"
         t = threading.Thread(
             target=worker,
-            args=(q, results, total, name),
+            args=(q, results, total, name, allow_early_stop),
             name=name,
             daemon=True
         )
@@ -1085,7 +1139,7 @@ def _run_probe_phases(ip_source_list, results):
     last_batch_done = 0  # 上批次完成时的 _done_cnt 值
 
     while idx < total:
-        if _early_stop_flag[0]:
+        if allow_early_stop and _early_stop_flag[0]:
             log("INFO", "Early stop detected, stopping probe...")
             break
 
@@ -1098,12 +1152,13 @@ def _run_probe_phases(ip_source_list, results):
 
         # 等待这批完成：通过检查 _done_cnt 直到达到预期值
         expected_done = batch_end
-        while _done_cnt[0] < expected_done and not _early_stop_flag[0]:
+        while _done_cnt[0] < expected_done and (not allow_early_stop or not _early_stop_flag[0]):
             time.sleep(0.1)
 
         # 触发本批次的增量测速（只在有新完成的 IP 时）
         if _done_cnt[0] > last_batch_done and len(results) > 0:
-            incremental_batch_speed_test(results, batch_size=batch_size, target_pass_total=20)
+            incremental_batch_speed_test(results, batch_size=batch_size, target_pass_total=20,
+                                         allow_early_stop=allow_early_stop)
             last_batch_done = _done_cnt[0]
 
     # 等队列清空
@@ -1116,22 +1171,19 @@ def _run_probe_phases(ip_source_list, results):
     for t in ts:
         t.join()
 
-    # 全部探测结束后，按速度排名赋最终分
-    _rank_by_speed(results)
+    # _rank_by_speed 已移至 main() 统一调用
 
 def main():
-    """主入口：拉取数据源 → DNS 解析 → 多线程探测 → 速度复测 → 上报 → 可选同步阿里云 DNS"""
+    """主入口：拉取数据源 → 两阶段探测 → 速度复测 → 上报 → 可选同步阿里云 DNS"""
     # 启动前校验 full 模式配置
     if not ORIGIN_SNI_LIST or not ORIGIN_TEST_PATH:
         log("ERROR", "ORIGIN_SNI_LIST 和 ORIGIN_TEST_PATH 不能为空！请检查脚本顶部配置。")
         sys.exit(1)
     log("INFO", f"mode={PROBE_MODE} SNI={ORIGIN_SNI_LIST} path={ORIGIN_TEST_PATH} verify={ORIGIN_VERIFY_CERT}")
 
-
     # 1. 获取历史优结果 (HAVE_POST_RES) - 优先级最高
     have_post_res_list = fetch_have_post_res()
-    have_post_ip_sources = [(ip, url) for ip, url, speed in have_post_res_list]
-    log("INFO", f"Priority-1 (HAVE_POST_RES): {len(have_post_ip_sources)} IPs to probe first")
+    log("INFO", f"HAVE_POST_RES: {len(have_post_res_list)} items fetched")
 
     # 2. 获取第三方 IP (IP_SET_URLS) - 优先级中等
     wetest_ip_sources = fetch_wetest_ips()
@@ -1143,34 +1195,56 @@ def main():
     domain_ip_sources = resolve_domains_concurrent(domains, max_workers=40)
     log("INFO", f"Priority-3 (DOMAINS_SET_URL): {len(domain_ip_sources)} IPs from DNS resolution")
 
-    # 4. 合并去重：按优先级顺序，已出现过的 IP 不再添加
-    seen = set()
-    all_ip_sources = []
+    # 4. 按历史测速成绩分组：speed >= LOWEST_SPEED*0.5 的 IP 进入 Phase 1
+    speed_threshold = LOWEST_SPEED * 0.5
+    priority_ips = [(ip, url) for ip, url, speed in have_post_res_list if speed >= speed_threshold]
+    log("INFO", f"Phase-1 priority IPs (speed >= {speed_threshold}KB/s): {len(priority_ips)}")
 
-    # Priority-1: 历史优结果优先
-    for ip, url in have_post_ip_sources:
+    # 非优先级 IP：历史低分 + wetest + 域名解析 IP，按优先级去重
+    seen = set()
+    for ip, _ in priority_ips:
+        seen.add(ip)
+
+    remaining_ips = []
+    # 历史优结果中未达标的
+    for ip, url, _ in have_post_res_list:
         if ip not in seen:
             seen.add(ip)
-            all_ip_sources.append((ip, url))
-
-    # Priority-2: 第三方 IP 补充
+            remaining_ips.append((ip, url))
+    # wetest IP
     for ip, url in wetest_ip_sources:
         if ip not in seen:
             seen.add(ip)
-            all_ip_sources.append((ip, url))
-
-    # Priority-3: 域名解析 IP 补充
+            remaining_ips.append((ip, url))
+    # 域名解析 IP
     for ip, url in domain_ip_sources:
         if ip not in seen:
             seen.add(ip)
-            all_ip_sources.append((ip, url))
+            remaining_ips.append((ip, url))
 
-    log("INFO", f"Final IPs to probe: {len(all_ip_sources)} (after dedup by priority)")
+    log("INFO", f"Phase-2 remaining IPs: {len(remaining_ips)}")
+    log("INFO", f"Total IPs to probe: {len(priority_ips) + len(remaining_ips)}")
 
-    # 4. 并发探测所有 IP（内置增量批次测速）
     results = []
-    _run_probe_phases(all_ip_sources, results)
-    log("INFO", f"Total IPs probed={len(all_ip_sources)} valid={len(results)} fail={_fail_cnt[0]}")
+
+    # Phase 1: 优先级 IP 探测（禁用早停）
+    if priority_ips:
+        _run_probe_phases(priority_ips, results, allow_early_stop=False)
+        log("INFO", f"Phase-1 done: {len(results)} valid results")
+
+        # Phase 1 全量测速
+        _full_batch_speed_test(results)
+        log("INFO", f"Phase-1 speed test done")
+
+    # Phase 2: 其余 IP 探测（启用早停）
+    if remaining_ips:
+        _run_probe_phases(remaining_ips, results, allow_early_stop=True)
+        log("INFO", f"Phase-2 done: {len(results)} valid results")
+
+    # 统一速度排名赋分
+    _rank_by_speed(results)
+
+    log("INFO", f"Total IPs probed={len(priority_ips) + len(remaining_ips)} valid={len(results)} fail={_fail_cnt[0]}")
 
     # 5. 上报所有探测结果
     post_all_results(results)
@@ -1190,7 +1264,6 @@ def main():
     else:
         # 没有 IP 完成测速，回退到所有结果
         log("WARN", "No IPs have completed speed test, falling back to all results")
-        speed_confirmed = results
         top_n_res = (
             top_region(results, colo="HKG", topN=8) +
             top_region(results, region="NorthAmerica", topN=8) +
@@ -1199,7 +1272,7 @@ def main():
         top_n_res = select_top(top_n_res, 10)
 
     print_top_results(top_n_res)
-    
+
     #更改aliyun DNS
     if CHANGE_DNS_RESOLVE:
         for cfg in ALI_DNS_TARGETS:
