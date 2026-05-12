@@ -54,39 +54,6 @@ CONCURRENCY = {"istoreos": 8, "windows": 20, "macos": 10, "linux": 10}.get(PLATF
 IP_RE = re.compile(r'\b((?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?))\b')
 
 # ================= colo 映射 =================
-COLO_NAME = {
-    "PEK": "Beijing", "PKX": "Beijing Daxing", "PVG": "Shanghai Pudong", "SHA": "Shanghai Hongqiao",
-    "CAN": "Guangzhou", "SZX": "Shenzhen", "CTU": "Chengdu", "HGH": "Hangzhou",
-    "NKG": "Nanjing", "WUH": "Wuhan", "XIY": "Xi'an", "CKG": "Chongqing",
-    "TSN": "Tianjin", "DLC": "Dalian", "TAO": "Qingdao", "XMN": "Xiamen",
-    "FOC": "Fuzhou", "CSX": "Changsha", "KMG": "Kunming", "URC": "Urumqi",
-    "HKG": "Hong Kong", "MFM": "Macau", "TPE": "Taipei", "TSA": "Taipei Songshan",
-    "NRT": "Tokyo", "HND": "Tokyo Haneda", "KIX": "Osaka", "NGO": "Nagoya", "FUK": "Fukuoka", "CTS": "Sapporo",
-    "ICN": "Seoul", "GMP": "Seoul Gimpo", "PUS": "Busan", "SIN": "Singapore",
-    "LAX": "Los Angeles", "SFO": "San Francisco", "SJC": "San Jose", "OAK": "Oakland",
-    "SEA": "Seattle", "PDX": "Portland", "SAN": "San Diego",
-    "DFW": "Dallas", "DEN": "Denver", "PHX": "Phoenix", "LAS": "Las Vegas",
-    "ORD": "Chicago", "MSP": "Minneapolis", "DTW": "Detroit",
-    "ATL": "Atlanta", "MIA": "Miami", "IAD": "Washington DC",
-    "EWR": "New York", "BOS": "Boston", "PHL": "Philadelphia", "CLT": "Charlotte", "MCO": "Orlando",
-    "YVR": "Vancouver", "YYZ": "Toronto", "YUL": "Montreal", "HNL": "Honolulu",
-    "LHR": "London", "CDG": "Paris", "FRA": "Frankfurt", "AMS": "Amsterdam", "MAD": "Madrid",
-    "DUB": "Dublin", "BRU": "Brussels", "ZRH": "Zurich", "VIE": "Vienna",
-    "CPH": "Copenhagen", "ARN": "Stockholm", "OSL": "Oslo", "HEL": "Helsinki",
-    "WAW": "Warsaw", "PRG": "Prague", "BUD": "Budapest",
-    "ATH": "Athens", "IST": "Istanbul", "MXP": "Milan", "FCO": "Rome",
-    "BCN": "Barcelona", "LIS": "Lisbon",
-    "BKK": "Bangkok", "KUL": "Kuala Lumpur", "MNL": "Manila", "SGN": "Ho Chi Minh City",
-    "CGK": "Jakarta", "DPS": "Bali", "HAN": "Hanoi",
-    "BOM": "Mumbai", "DEL": "New Delhi", "MAA": "Chennai", "BLR": "Bangalore",
-    "DXB": "Dubai", "AUH": "Abu Dhabi", "DOH": "Doha",
-    "RUH": "Riyadh", "JED": "Jeddah", "TLV": "Tel Aviv",
-    "JNB": "Johannesburg", "CPT": "Cape Town", "CAI": "Cairo", "LOS": "Lagos",
-    "NBO": "Nairobi", "ADD": "Addis Ababa", "CMN": "Casablanca",
-    "GRU": "Sao Paulo", "GIG": "Rio de Janeiro", "EZE": "Buenos Aires", "SCL": "Santiago",
-    "LIM": "Lima", "BOG": "Bogota", "SYD": "Sydney", "MEL": "Melbourne",
-    "BNE": "Brisbane", "PER": "Perth", "AKL": "Auckland", "WLG": "Wellington",
-}
 REGION_MAP = {
     "HKG": "HONGKONG", "MFM": "HONGKONG",
     "TPE": "EastAsia", "TSA": "EastAsia", "NRT": "EastAsia", "HND": "EastAsia", "KIX": "EastAsia",
@@ -147,7 +114,7 @@ def log(level, msg):
         try:
             with open(str(LOG_FILE), "a", encoding="utf-8") as f:
                 f.write(line + "\n")
-        except: pass
+        except OSError: pass
     if level in ("INFO", "ERROR", "WARN", "HIT", "FINAL", "PROG"):
         print(line)
         sys.stdout.flush()
@@ -159,7 +126,7 @@ def _http_get(url, timeout=15):
         try:
             r = subprocess.run([CURL_BIN, "-sf", "--max-time", str(timeout), url], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout+3)
             if r.returncode == 0: return r.stdout
-        except: pass
+        except Exception: pass
     try:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
@@ -212,7 +179,7 @@ def _http_post_file(url, payload_str, timeout=15):
                 if tmp_path:
                     try:
                         os.unlink(tmp_path)
-                    except:
+                    except OSError:
                         pass
 
         # ---------- 回退：urllib ----------
@@ -357,6 +324,62 @@ def filter_cf_ips(ips_list):
     return filtered
 
 # ================= DNS 解析 =================
+def _fetch_have_post_res(url):
+    """从单个 HAVE_POST_RES URL 获取历史优结果，返回 (ip, source_url, speed_kb_s) 列表"""
+    try:
+        raw = _http_get(url, timeout=20)
+        if not raw:
+            return []
+        data = json.loads(raw.decode())
+        if not isinstance(data, list):
+            return []
+        results = []
+        for item in data:
+            ip = item.get("ip")
+            speed = item.get("speed_kb_s", 0)
+            if ip:
+                results.append((ip, url, speed))
+        log("INFO", f"[HAVE_POST_RES] {url} got={len(results)} items")
+        return results
+    except Exception as e:
+        log("WARN", f"_fetch_have_post_res failed {url}: {e}")
+        return []
+
+def fetch_have_post_res():
+    """
+    从 HAVE_POST_RES 获取历史优结果。
+    返回格式：[(ip, source_url, speed_kb_s), ...]
+    按 speed_kb_s 降序排列（速度快的在前）。
+    """
+    if not HAVE_POST_RES:
+        log("INFO", "HAVE_POST_RES is empty, skip")
+        return []
+
+    urls = list(set(HAVE_POST_RES))  # 去重
+    all_results = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(urls), 20)) as executor:
+        future_to_url = {executor.submit(_fetch_have_post_res, u): u for u in urls}
+        for future in concurrent.futures.as_completed(future_to_url):
+            try:
+                results = future.result()
+                all_results.extend(results)
+            except Exception:
+                pass
+
+    # 按 IP 去重，同一 IP 保留 speed_kb_s 最高的记录
+    ip_best = {}
+    for ip, url, speed in all_results:
+        if ip not in ip_best or speed > ip_best[ip][1]:
+            ip_best[ip] = (url, speed)
+
+    # 转换为列表并按 speed_kb_s 降序排序（没有 speed_kb_s 的排后面）
+    result_list = [(ip, url, speed) for ip, (url, speed) in ip_best.items()]
+    result_list.sort(key=lambda x: x[2] if x[2] > 0 else float('-inf'), reverse=True)
+
+    log("INFO", f"HAVE_POST_RES: raw={len(all_results)}, deduped={len(result_list)} items (sorted by speed_kb_s DESC)")
+    return result_list
+
 def fetch_wetest_ips():
     """并发从所有 IP_SET_URLS 抓取 IPv4 地址，过滤非 Cloudflare 网段，返回 [(ip, source_url), ...]"""
     ip_source = {}  # ip -> source_url
@@ -448,77 +471,41 @@ def _resolve_via_nslookup(domain):
         return []
     
 
-def _resolve_via_alibaba_doh(domain):
-    """
-    方法3：通过阿里 DoH（HTTPS JSON API）解析域名，作为终极 fallback。
-    使用 curl 请求 https://dns.alidns.com/resolve?name=...&type=A，解析 Answer 字段。
-    """
+def _resolve_via_doh(domain, url, name="DoH"):
+    """通过 DoH（HTTPS JSON API）解析域名，返回 IPv4 列表（过滤 fake-ip 段）。"""
     if not HAS_CURL:
         return []
     try:
         r = subprocess.run(
-            [CURL_BIN, "-sf", "--max-time", "5",
-             f"https://dns.alidns.com/resolve?name={domain}&type=A"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3
-        )
-        if r.returncode != 0:
-            return []
-        data = json.loads(r.stdout.decode())
-        ips = [
-            ans.get("data", "").strip()
-            for ans in data.get("Answer", [])
-            if is_ip(ans.get("data", "").strip()) and not ans.get("data", "").strip().startswith("198.18.")
-        ]
-        ips = list(dict.fromkeys(ips))
-        if ips:
-            log("INFO", f"resolve {domain} via alibaba DoH(dns.alidns.com) -> {ips}")
-        return ips
-    except Exception as e:
-        return []
-
-
-def _resolve_via_tencent_doh(domain):
-    """
-    方法3：通过腾讯 DoH 解析域名，作为终极 fallback。
-    使用 curl 请求 https://doh.pub/dns-query?name=...&type=A
-    """
-    if not HAS_CURL:
-        return []
-    try:
-        r = subprocess.run(
-            [CURL_BIN, "-sf", "--max-time", "5",
-             "-H", "accept: application/dns-json",
-             f"https://doh.pub/dns-query?name={domain}&type=A"],
+            [CURL_BIN, "-sf", "--max-time", "5", "-H", "accept: application/dns-json", url],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3
         )
         if r.returncode != 0:
             return []
         data = json.loads(r.stdout.decode())
         ips = []
-        if "Answer" in data:
-            for ans in data["Answer"]:
-                if ans.get("type") == 1:  # A 记录
-                    ip = ans.get("data", "").strip()
-                    if is_ip(ip) and not ip.startswith("198.18."):
-                        ips.append(ip)
+        for ans in data.get("Answer", []):
+            if ans.get("type") == 1:  # A 记录
+                ip = ans.get("data", "").strip()
+                if is_ip(ip) and not ip.startswith("198.18."):
+                    ips.append(ip)
         ips = list(dict.fromkeys(ips))
         if ips:
-            log("INFO", f"resolve {domain} via tencent DoH(doh.pub) -> {ips}")
+            log("INFO", f"resolve {domain} via {name} -> {ips}")
         return ips
-    except Exception as e:
+    except Exception:
         return []
 
 def resolve_remote_ip(domain):
     """
     域名解析入口：依次尝试三种方法，返回第一个成功的 IP 列表。
-    - Linux/macOS/iStoreOS: dig → DoH
-    - Windows: nslookup → DoH
+    - Tencent DoH → Alibaba DoH → dig (Linux/macOS) / nslookup (Windows)
     全部失败返回 None。
     """
-    ips = _resolve_via_tencent_doh(domain)
+    ips = _resolve_via_doh(domain, f"https://doh.pub/dns-query?name={domain}&type=A", name="tencent DoH(doh.pub)")
     if ips:
         return ips
-    ips = _resolve_via_alibaba_doh(domain)
+    ips = _resolve_via_doh(domain, f"https://dns.alidns.com/resolve?name={domain}&type=A", name="alibaba DoH(dns.alidns.com)")
     if ips:
         return ips
 
@@ -536,12 +523,14 @@ def resolve_remote_ip(domain):
 
 def resolve_domains_concurrent(domains, max_workers=None):
     """
-    并发解析域名列表，返回所有 IPv4 地址的 (ip, source_url) 列表（仅 Cloudflare 网段）。
+    并发解析域名列表，返回所有 IPv4 地址的 (ip, source_domain) 列表（仅 Cloudflare 网段）。
     max_workers 默认使用全局 CONCURRENCY。
+    source 字段使用解析该 IP 的原始域名，而非 DOMAINS_SET_URL。
     """
     if max_workers is None:
         max_workers = CONCURRENCY
     all_ips = set()
+    ip_to_domain = {}
     dns_resolve_failed = set()
     log("INFO", f"Starting concurrent DNS resolution for {len(domains)} domains (workers={max_workers})")
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -552,6 +541,9 @@ def resolve_domains_concurrent(domains, max_workers=None):
                 ips = future.result()
                 if ips:
                     all_ips.update(ips)
+                    for ip in ips:
+                        if ip not in ip_to_domain:
+                            ip_to_domain[ip] = domain
                 else: dns_resolve_failed.add(domain)
             except Exception as e:
                 log("Error", f"DNS resolution failed.")
@@ -560,37 +552,52 @@ def resolve_domains_concurrent(domains, max_workers=None):
     filtered_ips = filter_cf_ips(raw_ip_list)
     log("INFO", f"DNS resolution done, unique IPs: raw={len(raw_ip_list)}, cf_filtered={len(filtered_ips)}")
     log("INFO", f"DNS resolution done, dns resolve failed :  count={len(dns_resolve_failed)} , dns_resolve_failed:{dns_resolve_failed}")
-    # 所有解析出的 IP 来源统一标记为 DOMAINS_SET_URL
-    return [(ip, DOMAINS_SET_URL) for ip in filtered_ips]
+    # Optimization 1: source 字段使用解析该 IP 的原始域名
+    return [(ip, ip_to_domain[ip]) for ip in filtered_ips]
 
 
 # ================= 🔥 核心探测函数（纯Python原生） =================
-# 快速获取 colo
+def _create_tls_socket(ip, domain, timeout, verify_cert=False):
+    """创建 TLS 连接到 IP:443，返回 (raw_socket, ssl_socket)"""
+    sock = socket.create_connection((ip, 443), timeout=timeout)
+    ctx = ssl.create_default_context()
+    if verify_cert:
+        ctx.check_hostname = True; ctx.verify_mode = ssl.CERT_REQUIRED
+    else:
+        ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+    return sock, ctx.wrap_socket(sock, server_hostname=domain)
+
+def _recv_until(ssock, stop_markers, max_size=4096):
+    """从 SSL 套接字读取直到所有标记在数据中出现或达到 max_size"""
+    data = b""
+    while len(data) < max_size:
+        chunk = ssock.recv(1024 * 128)
+        if not chunk: break
+        data += chunk
+        if all(m in data for m in stop_markers): break
+    return data
+
+def _parse_colo(data):
+    """从 /cdn-cgi/trace 响应字节中解析 colo 值，未找到返回 None"""
+    for line in data.decode(errors="ignore").splitlines():
+        if line.startswith("colo="):
+            return line.split("=", 1)[1].strip()
+    return None
+
 def fetch_colo_from_trace(ip, domain="la.pingshaisland.top", timeout=10):
     """探测 /cdn-cgi/trace 获取 colo（纯网络测量，无缓存）"""
     sock = None
     try:
-        sock = socket.create_connection((ip, 443), timeout=timeout)
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-        ssock = ctx.wrap_socket(sock, server_hostname=domain)
+        sock, ssock = _create_tls_socket(ip, domain, timeout)
         ssock.send(f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\n\r\n".encode())
-        data = b""
-        while len(data) < 4096:
-            chunk = ssock.recv(1024 * 128)
-            if not chunk: break
-            data += chunk
-            if b"\r\n\r\n" in data and b"colo=" in data: break
-        for line in data.decode(errors="ignore").splitlines():
-            if line.startswith("colo="):
-                return line.split("=", 1)[1].strip()
-        return None
+        data = _recv_until(ssock, [b"\r\n\r\n", b"colo="], max_size=4096)
+        return _parse_colo(data)
     except Exception:
         return None
     finally:
         if sock:
             try: sock.close()
-            except: pass
+            except OSError: pass
 
 def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
     """全链路延迟测量：本地 → CF边缘 → VPS回源"""
@@ -632,32 +639,17 @@ def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
         try:
             ssock.settimeout(3)
             ssock.sendall(f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {domain}\r\nConnection: keep-alive\r\n\r\n".encode())
+            trace_data = _recv_until(ssock, [b"\r\n\r\n", b"colo="], max_size=4096)
+            colo = _parse_colo(trace_data)
+            if colo:
+                res['colo'] = colo
+            else:
+                preview = trace_data[:500].decode(errors="ignore").replace("\r\n", "\\n")
+                log("WARN", f"ip={ip} colo missing in response, body preview: {preview}")
+        except socket.timeout:
+            log("WARN", f"ip={ip} colo recv timeout")
         except Exception as e:
-            log("WARN", f"ip={ip} colo send failed: {e}")
-        else:
-            try:
-                trace_data = b""
-                while len(trace_data) < 4096:
-                    chunk = ssock.recv(1024 * 128)
-                    if not chunk: break
-                    trace_data += chunk
-                    if b"\r\n\r\n" in trace_data and b"colo=" in trace_data: break
-                if not trace_data:
-                    log("WARN", f"ip={ip} colo recv: connection closed before response")
-                else:
-                    found = False
-                    for line in trace_data.decode(errors="ignore").splitlines():
-                        if line.startswith("colo="):
-                            res['colo'] = line.split("=", 1)[1].strip()
-                            found = True
-                            break
-                    if not found:
-                        preview = trace_data[:500].decode(errors="ignore").replace("\r\n", "\\n")
-                        log("WARN", f"ip={ip} colo missing in response, body preview: {preview}")
-            except socket.timeout:
-                log("WARN", f"ip={ip} colo recv timeout")
-            except Exception as e:
-                log("WARN", f"ip={ip} colo recv failed: {e}")
+            log("WARN", f"ip={ip} colo recv failed: {e}")
 
     # 4. HTTP TTFB（测试文件）
     req = _build_request("GET", f"{test_path}?t={int(time.time())}", domain, "close",
@@ -669,11 +661,8 @@ def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
 
         first_byte = ssock.recv(1)  # TTFB 关键点
         if not first_byte: raise Exception("No response")
-        
-        # 读取响应头
-        data = first_byte
-        if data :
-           data+=ssock.recv(1024*128)  # 接受 128KB
+
+        data = first_byte + ssock.recv(1024 * 128)
         recv_time = 0
         data_length = len(data)
         while True:
@@ -699,9 +688,9 @@ def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
         log("WARN", f"ip={ip} HTTP request failed: {e}")
     finally:
         try: ssock.unwrap()
-        except: pass
+        except (OSError, AttributeError): pass
         try: sock.shutdown(socket.SHUT_RDWR)
-        except: pass
+        except OSError: pass
         sock.close()
     return res
 
@@ -734,50 +723,49 @@ def _probe_single_ip(real_ip, target, source_url=None):
     """对单个 IP 重复探测 PROBE_REPEAT 次，遍历所有 ORIGIN_SNI，返回评分结果字典；失败返回 None"""
     tcp_ok = tls_ok = http_ok = 0
     latencies = []
-    eachProbeInfo = []
+    each_probe_info = []
     colo = None
     # 保存最后一次成功探测的分层耗时（用于上传）
     last_tcp_ms = last_tls_ms = last_ttfb_ms = last_total_ms = 0
 
     for i in range(PROBE_REPEAT):
-        for ORIGIN_SNI in ORIGIN_SNI_LIST:
+        for sni in ORIGIN_SNI_LIST:
             latency=None
             time.sleep(SLEEP_INTERVAL)
             if PROBE_MODE == "full":
-                res = probe_full_path(real_ip, ORIGIN_SNI, test_path=ORIGIN_TEST_PATH, timeout=TIMEOUT)
+                res = probe_full_path(real_ip, sni, test_path=ORIGIN_TEST_PATH, timeout=TIMEOUT)
                 if not res['success']:
-                    log("WARN", f"ip={real_ip} probe_full_path failed for {ORIGIN_SNI}: {res.get('error', 'unknown')}")
-                    return None
+                    log("WARN", f"ip={real_ip} probe_full_path failed for {sni}: {res.get('error', 'unknown')}")
+                    continue
                 colo = res.get('colo')
                 if colo:
                     with _colo_cache_lock:
                         _colo_cache[real_ip] = colo
                 if not colo:
-                    log("WARN", f"ip={real_ip} colo is UNKNOWN after successful probe_full_path for {ORIGIN_SNI}")
+                    log("WARN", f"ip={real_ip} colo is UNKNOWN after probe_full_path for {sni}")
                     colo = "UNKNOWN"
                 http_ok += 1
                 tcp_ok += 1
                 tls_ok += 1
                 latency = round(res['tcp_ms']+res['ttfb_ms'],1)
                 latencies.append(latency)
-                eachProbeInfo.append(colo+":"+str(latency)+"ms")
-                # 记录分层耗时
+                each_probe_info.append(colo+":"+str(latency)+"ms")
                 last_tcp_ms = res.get('tcp_ms', 0)
                 last_tls_ms = res.get('tls_ms', 0)
                 last_ttfb_ms = res.get('ttfb_ms', 0)
                 last_total_ms = res.get('total_ms', 0)
             else:
                 t0 = time.perf_counter()
-                colo = fetch_colo_from_trace(real_ip, ORIGIN_SNI)
+                colo = fetch_colo_from_trace(real_ip, sni)
                 if not colo:
-                    log("WARN", f"ip={real_ip} failed to get colo (edge mode) for {ORIGIN_SNI}")
-                    return None
+                    log("WARN", f"ip={real_ip} failed to get colo (edge mode) for {sni}")
+                    continue
                 latency = round((time.perf_counter() - t0) * 1000, 1)
                 latencies.append(latency)
                 tcp_ok += 1
                 tls_ok += 1
                 http_ok += 1
-                eachProbeInfo.append(colo+":"+str(latency)+"ms")
+                each_probe_info.append(colo+":"+str(latency)+"ms")
 
     sorted_lat = sorted(latencies)
     trimmed_lat = sorted_lat[:-1] if len(sorted_lat) >= 3 else sorted_lat
@@ -790,7 +778,7 @@ def _probe_single_ip(real_ip, target, source_url=None):
     if score >= 999999:
         log("WARN", f"ip={real_ip} discarded: tcp_loss={tcp_loss} tls_loss={tls_loss} (score={score})")
 
-    log("INFO", f'avg_lat={avg_lat}ms ip={real_ip} {eachProbeInfo}')
+    log("INFO", f'avg_lat={avg_lat}ms ip={real_ip} {each_probe_info}')
 
     return {
         "target": target, "real_ip": real_ip, "colo": colo,
@@ -871,7 +859,9 @@ def _dedup_by_best_score(results):
     """按 real_ip 去重，同一 IP 多条记录时保留 score 最低的"""
     best = {}
     for r in results:
-        if r["real_ip"] not in best or r["score"] < best[r["real_ip"]]["score"]: best[r["real_ip"]] = r
+        ip = r["real_ip"]
+        if ip not in best or r["score"] < best[ip]["score"]:
+            best[ip] = r
     return list(best.values())
 
 def select_top(results, n=TOP_N):
@@ -932,7 +922,7 @@ def send_to_aliyunDNS(ip_list, domain, max_retry=ALI_DNS_MAX_RETRY):
         from alibabacloud_alidns20150109.client import Client as DnsClient
         from alibabacloud_tea_openapi import models as open_api_models
         from alibabacloud_alidns20150109 import models as dns_models
-    except:
+    except ImportError:
         log("ERROR", "Aliyun SDK not installed")
         return
     config = open_api_models.Config(access_key_id=ALI_ACCESS_KEY_ID,access_key_secret=ALI_ACCESS_KEY_SECRET,)
@@ -973,30 +963,6 @@ def send_to_aliyunDNS(ip_list, domain, max_retry=ALI_DNS_MAX_RETRY):
             log("WARN", f"AliDNS retry in {sleep_sec}s...")
             time.sleep(sleep_sec)
 
-def test_download_speed(test_list, lowest_speed=850, count=20):
-    """对优选 IP 做下载速度复测：用 10MB 测试文件测速，速度达标则更新 score/lat，累计 count 个达标即停止"""
-    if not test_list:
-        log("WARN", "No IPs to test_download_speed, skip")
-        return 0
-    pass_cnt = 0
-
-    for each in test_list:
-        test_download_speed_res = probe_full_path(each['real_ip'], ORIGIN_SNI_LIST[0], test_path=ORIGIN_SPEED_TEST_PATH, timeout=100)
-        if not test_download_speed_res['success']:
-            continue
-        cost_time_ms = round(test_download_speed_res['tcp_ms'] + test_download_speed_res['ttfb_ms'], 1)
-        download_speed = round((10 * 1024) / (cost_time_ms / 1000), 1)
-        each['download_speed'] = round(download_speed, 1)
-        each['download_cost_time'] = cost_time_ms
-        each['score'] = round(each['score'] - download_speed, 1)
-        each['lat'] = round(each['lat'] - download_speed, 1)
-        log("INFO", f"colo={each['colo']}  ip={each['real_ip']}  download_speed={each['download_speed']}KB/S cost_time_ms={each['download_cost_time']} score={each['score']}")
-        if download_speed > lowest_speed:
-            pass_cnt += 1
-        if pass_cnt >= count:
-            break
-    return pass_cnt
-
 def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20):
     """
     增量批次测速：每完成 batch_size 个 IP 延迟测试后，从已完成的结果中选取三区域各 Top5 进行测速。
@@ -1011,9 +977,9 @@ def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20):
     with _batch_lock:
         # 从当前结果中选取三区域各 Top5
         try:
-            na_top = top_region(results, region="NorthAmerica", topN=5)
+            na_top = top_region(results, region="NorthAmerica", topN=8)
             hk_top = top_region(results, colo="HKG", topN=5)
-            ea_top = top_region(results, region="EastAsia", topN=5)
+            ea_top = top_region(results, region="EastAsia", topN=2)
         except ValueError:
             return 0  # 结果不足
 
@@ -1045,10 +1011,9 @@ def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20):
 
             each['download_speed'] = round(download_speed, 1)
             each['download_cost_time'] = cost_time_ms
-            each['score'] = round(each['score'] - download_speed, 1)
-            each['lat'] = round(each['lat'] - download_speed, 1)
+            each['score'] = round(cost_time_ms, 2)  # 测速成绩决定评分
 
-            log("INFO", f"BATCH colo={each['colo']} ip={each['real_ip']} download_speed={each['download_speed']}KB/S score={each['score']}")
+            log("INFO", f"BATCH colo={each['colo']} ip={each['real_ip']} download_speed={each['download_speed']}KB/S lat={each['lat']}ms")
 
             if download_speed > LOWEST_SPEED:
                 local_pass += 1
@@ -1136,33 +1101,76 @@ def main():
     log("INFO", f"mode={PROBE_MODE} SNI={ORIGIN_SNI_LIST} path={ORIGIN_TEST_PATH} verify={ORIGIN_VERIFY_CERT}")
 
 
-    # 1. 并发获取域名列表和原始 IP 列表（带来源 URL）
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        future_domains = executor.submit(fetch_domains)
-        future_ips = executor.submit(fetch_wetest_ips)
-        domains = list(dict.fromkeys(future_domains.result()))
-        wetest_ip_sources = future_ips.result()  # [(ip, source_url), ...]
-    log("INFO", f"Total domains={len(domains)}, wetest IP sources={len(wetest_ip_sources)}")
+    # 1. 获取历史优结果 (HAVE_POST_RES) - 优先级最高
+    have_post_res_list = fetch_have_post_res()
+    have_post_ip_sources = [(ip, url) for ip, url, speed in have_post_res_list]
+    log("INFO", f"Priority-1 (HAVE_POST_RES): {len(have_post_ip_sources)} IPs to probe first")
 
-    # 2. 并发解析所有域名 → 得到域名解析出的 (ip, source_url) 列表
+    # 2. 获取第三方 IP (IP_SET_URLS) - 优先级中等
+    wetest_ip_sources = fetch_wetest_ips()
+    log("INFO", f"Priority-2 (IP_SET_URLS): {len(wetest_ip_sources)} IPs to probe")
+
+    # 3. 获取域名列表并解析 DNS (DOMAINS_SET_URL) - 优先级最低
+    domains = fetch_domains()
+    domains = list(dict.fromkeys(domains))
     domain_ip_sources = resolve_domains_concurrent(domains, max_workers=40)
+    log("INFO", f"Priority-3 (DOMAINS_SET_URL): {len(domain_ip_sources)} IPs from DNS resolution")
 
-    # 3. 合并去重：域名来源优先，IP_SET 来源补充
+    # 4. 合并去重：按优先级顺序，已出现过的 IP 不再添加
     seen = set()
     all_ip_sources = []
-    for ip, url in domain_ip_sources + wetest_ip_sources:
+
+    # Priority-1: 历史优结果优先
+    for ip, url in have_post_ip_sources:
         if ip not in seen:
             seen.add(ip)
             all_ip_sources.append((ip, url))
-    log("INFO", f"Final IPs to probe: {len(all_ip_sources)}")
+
+    # Priority-2: 第三方 IP 补充
+    for ip, url in wetest_ip_sources:
+        if ip not in seen:
+            seen.add(ip)
+            all_ip_sources.append((ip, url))
+
+    # Priority-3: 域名解析 IP 补充
+    for ip, url in domain_ip_sources:
+        if ip not in seen:
+            seen.add(ip)
+            all_ip_sources.append((ip, url))
+
+    log("INFO", f"Final IPs to probe: {len(all_ip_sources)} (after dedup by priority)")
 
     # 4. 并发探测所有 IP（内置增量批次测速）
     results = []
     _run_probe_phases(all_ip_sources, results)
     log("INFO", f"Total IPs probed={len(all_ip_sources)} valid={len(results)} fail={_fail_cnt[0]}")
-    post_all_results(select_top(results,1000))
-    top_n_res = top_region(results, colo="HKG", topN=8)+top_region(results, region="NorthAmerica", topN=8)+top_region(results, region="EastAsia", topN=8) 
-    top_n_res = select_top(top_n_res,10)
+
+    # 5. 上报所有探测结果
+    post_all_results(results)
+
+    # 6. 最终选优：只从已测速的 IP 中选取（speed_confirmed 列表）
+    speed_confirmed = [r for r in results if r.get('download_speed', 0) > 0]
+
+    if speed_confirmed:
+        log("INFO", f"Final selection: {len(speed_confirmed)} IPs have completed speed test")
+        # 从已测速 IP 中按区域选取
+        top_n_res = (
+            top_region(speed_confirmed, colo="HKG", topN=8) +
+            top_region(speed_confirmed, region="NorthAmerica", topN=8) +
+            top_region(speed_confirmed, region="EastAsia", topN=8)
+        )
+        top_n_res = select_top(top_n_res, 10)
+    else:
+        # 没有 IP 完成测速，回退到所有结果
+        log("WARN", "No IPs have completed speed test, falling back to all results")
+        speed_confirmed = results
+        top_n_res = (
+            top_region(results, colo="HKG", topN=8) +
+            top_region(results, region="NorthAmerica", topN=8) +
+            top_region(results, region="EastAsia", topN=8)
+        )
+        top_n_res = select_top(top_n_res, 10)
+
     print_top_results(top_n_res)
     
     #更改aliyun DNS
