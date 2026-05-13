@@ -108,7 +108,7 @@ main()
  │       └─ _probe_single_ip()                    -- 单 IP 多次探测 + 打分
  │           ├─ [full] probe_full_path()          -- TCP+TLS+HTTP 全链路
  │           │   ├─ colo 缓存 (_colo_cache)         -- 同 IP 只获取一次
- │           │   └─ 速率检查 (每 50 次 recv 检测 LOWEST_SPEED)
+ │           │   └─ 速率检查 (5秒时检查：速度 < LOWEST_SPEED*0.4 丢弃)
  │           └─ [edge] fetch_colo_from_trace()    -- 仅 trace 测延迟+colo
  ├─ incremental_batch_speed_test()                -- 增量批次测速 (三区域 Top5)
  ├─ post_all_results()                            -- 并发上报结果到多个 URL
@@ -159,8 +159,8 @@ score = avg_lat * WEIGHT_LATENCY + http_loss * LOSS_PENALTY_MS * WEIGHT_LOSS
 - **recv 缓冲区**: 128KB（与测试文件下载量匹配）
 - **HTTP 指纹**: 统一使用 Chrome 128 请求头常量 `_HTTP_FINGERPRINT`，通过 `_build_request()` 组装
 - **colo 与延迟同一连接**: `probe_full_path` 在 TLS 握手后先发 trace 拿 colo（keep-alive），再发测试文件请求（close），省掉一次 TCP+TLS
-- **增量批次测速**: 每完成 100 个 IP 延迟测试后，从三个区域（NorthAmerica/HKG/EastAsia）各取 Top5 进行 10MB 文件速度复测，累计达标 20 个即提前终止
-- **动态速率检查**: 下载测试文件时每 50 次 recv 检查当前速度，低于 `LOWEST_SPEED/4` 立即丢弃
+- **增量批次测速**: 每完成 100 个 IP 延迟测试后触发一次批次测速，从三个区域（NorthAmerica/HKG/EastAsia）各取 Top5 进行速度复测；累计达标 20 个即设置早停标志
+- **动态速率检查**: 测试文件下载时，5 秒时判断当前速度：若 `< LOWEST_SPEED*0.4` 则丢弃，若 `> LOWEST_SPEED` 则提前结束；10 秒强制结束
 
 ### 配置速查
 
@@ -183,7 +183,7 @@ score = avg_lat * WEIGHT_LATENCY + http_loss * LOSS_PENALTY_MS * WEIGHT_LOSS
 |--------|------|
 | `PROBE_MODE` | `"full"` 全链路 或 `"edge"` 仅 colo |
 | `ORIGIN_VERIFY_CERT` | 是否验证 TLS 证书 |
-| `SLEEP_INTERVAL` | 探测间隔（秒），默认 300 秒=5 分钟 |
+| `SLEEP_INTERVAL` | `3` | 探测间隔（秒） |
 | `TIMEOUT` | 单次探测超时（秒） |
 | `PROBE_REPEAT` | 每个 IP 重复探测次数 |
 | `LOWEST_SPEED` | 最低速度阈值 KB/s |
@@ -201,7 +201,7 @@ score = avg_lat * WEIGHT_LATENCY + http_loss * LOSS_PENALTY_MS * WEIGHT_LOSS
 
 ## 数据源
 
-`IP_SET_URLS` 从 wetest.vip、uouin.com、v2rayssr.com、4ce.cn、vps789.com 及 pingshaisland.top 各子 API 抓取 Cloudflare IP 段。
+`IP_SET_URLS` 从 wetest.vip、uouin.com、v2rayssr.com、4ce.cn、vps789.com  各子 API 抓取 Cloudflare IP 段。
 
 ## 已知陷阱
 
@@ -214,6 +214,6 @@ score = avg_lat * WEIGHT_LATENCY + http_loss * LOSS_PENALTY_MS * WEIGHT_LOSS
 
 - 改配置项：编辑 `config.py`，新增配置需同步更新 `config.example.py`（脱敏版）
 - 改 `_HTTP_FINGERPRINT` 常量会影响所有出站请求的指纹
-- 改 `probe_full_path` 时注意测试文件下载的速率检查逻辑（每 50 个 recv 检查一次 `LOWEST_SPEED`）
+- 改 `probe_full_path` 时注意测试文件下载的速率检查逻辑（5秒时检查：速度 < LOWEST_SPEED*0.4 则丢弃，> LOWEST_SPEED 则提前结束）
 - 线程安全：`_colo_cache`、`_tested_ips`、`_done_cnt`、`_fail_cnt`、`_early_stop_flag`、`_speed_pass_count`、`_batch_lock` 均有独立锁保护
 - worker 线程的 `task_done()` 必须在 `finally` 块中调用，否则队列 join 死锁
