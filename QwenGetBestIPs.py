@@ -628,8 +628,6 @@ def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
         log("WARN", f"ip={ip} TLS handshake failed: {e}")
         return res
     
-
-
     # 3. 获取 colo：优先缓存，未命中时才发 /cdn-cgi/trace（不计入延迟测量）
     with _colo_cache_lock:
         cached_colo = _colo_cache.get(ip)
@@ -664,30 +662,21 @@ def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
         t_speed_test_0 = time.perf_counter()
         data = first_byte + ssock.recv(1024 * 128)
         data_length = len(data)
-        test_when_3S= True
-        test_when_10S= True
         while True:
-            chunk = ssock.recv(1024*32)
+            chunk = ssock.recv(1024*64)
             if not chunk: break
             data_length = data_length+len(chunk)
             # 5S 强制结束条件
-            if (time.perf_counter() - t_speed_test_0)>=3 and  test_when_3S :
-                test_when_3S = False
+            if (time.perf_counter() - t_speed_test_0)>=5 :
+                costTime=time.perf_counter() - t_speed_test_0
                 now_speed = round((data_length / 1024) / (time.perf_counter() - t_speed_test_0), 1)
-                if now_speed < (LOWEST_SPEED*0.2):
-                    log("INFO", f"ip={ip} costTime={(time.perf_counter() - t_speed_test_0)}, speed={now_speed}KB/s < {LOWEST_SPEED*0.2}KB/s — discard!")
-                    raise Exception(f"{ip} too slow")
-            # 10S 强制结束条件
-            if (time.perf_counter() - t_speed_test_0)>=10 and  test_when_10S :
-                test_when_10S = False
-                now_speed = round((data_length / 1024) / (time.perf_counter() - t_speed_test_0), 1)
-                if now_speed < (LOWEST_SPEED*0.5):
-                    log("INFO", f"ip={ip} costTime={(time.perf_counter() - t_speed_test_0)}, speed={now_speed}KB/s < {LOWEST_SPEED*0.5}KB/s — discard!")
-                    raise Exception(f"{ip} too slow")
-            # 20S 强制结束
-            if (time.perf_counter() - t_speed_test_0)>=20:
-                now_speed = round((data_length / 1024) / (time.perf_counter() - t_speed_test_0), 1)
-                log("INFO", f"ip={ip} costTime={(time.perf_counter() - t_speed_test_0)}, speed={now_speed}KB/s !")
+                if now_speed > (LOWEST_SPEED):
+                    break
+                if now_speed < (LOWEST_SPEED*0.4):
+                    log("INFO", f"ip={ip} costTime={costTime}, speed={now_speed}KB/s < {LOWEST_SPEED*0.4}KB/s — discard!")
+                    break
+            # 10S 强制结束
+            if (time.perf_counter() - t_speed_test_0)>=10:
                 break
 
         # 记录实际下载速度（与 now_speed 同样计算公式：实际字节数 / 实际耗时）
@@ -907,20 +896,35 @@ def post_all_results(results):
     """将探测结果转为 JSON 并并发 POST 到所有上报地址（含来源 URL、分层耗时、速度等完整字段）"""
     if not results: return
     nodes = []
-    for r in sorted(results, key=lambda x: x.get("score", 999999)):
+    skipped = 0
+    for r in sorted(results, key=lambda x: x.get("score") or 999999):
+        ip   = (r.get("real_ip") or "").strip()
+        colo = (r.get("colo") or "").strip().upper()
+        score = r.get("score") or 999999
+        if not ip:
+            skipped += 1
+            continue
+        if not colo or colo in ("UNKNOWN", "NONE", "NULL"):
+            skipped += 1
+            continue
+        if not score or score > 9999:
+            skipped += 1
+            continue
         nodes.append({
-            "ip": r["real_ip"],
-            "colo": r.get("colo", ""),
-            "score": r.get("score", 999999),
-            "lat": r.get("lat", 0),
-            "loss": r.get("loss", 0),
-            "source": r.get("source_url", ""),
-            "speed_kb_s": r.get("download_speed", 0),
-            "tcp_ms": r.get("tcp_ms", 0),
-            "tls_ms": r.get("tls_ms", 0),
-            "ttfb_ms": r.get("ttfb_ms", 0),
-            "total_ms": r.get("total_ms", 0)
+            "ip": ip,
+            "colo": colo,
+            "score": score,
+            "lat": r.get("lat") or 0,
+            "loss": r.get("loss") or 0,
+            "source": r.get("source_url") or "",
+            "speed_kb_s": r.get("download_speed") or 0,
+            "tcp_ms": r.get("tcp_ms") or 0,
+            "tls_ms": r.get("tls_ms") or 0,
+            "ttfb_ms": r.get("ttfb_ms") or 0,
+            "total_ms": r.get("total_ms") or 0
         })
+    if skipped:
+        log("INFO", f"post_all_results: skipped {skipped} invalid nodes")
     log("INFO", f"post_all_results: uploading {len(nodes)} nodes")
     threads = [threading.Thread(target=_http_post_file, args=(u, json.dumps(nodes, ensure_ascii=False, indent=4, sort_keys=True)), daemon=False) for u in POST_URLS]
     for t in threads: t.start()
@@ -1026,7 +1030,7 @@ def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20, 
 
             # 用 probe_full_path 内部已计算的 download_speed（实际字节/实际耗时）
             each['download_speed'] = res['download_speed']
-            each['download_cost_time'] = round(res['tcp_ms'] + res['ttfb_ms'], 1)
+            each['download_cost_time'] = round(res['ttfb_ms'], 1)
             download_speed = each['download_speed']
 
             log("INFO", f"BATCH colo={each['colo']} ip={each['real_ip']} download_speed={each['download_speed']}KB/S lat={each['lat']}ms")
@@ -1061,8 +1065,7 @@ def _full_batch_speed_test(results):
     tested_count = 0
 
     for each in results:
-        res = probe_full_path(each['real_ip'], ORIGIN_SNI_LIST[0],
-                              test_path=ORIGIN_SPEED_TEST_PATH, timeout=100)
+        res = probe_full_path(each['real_ip'], ORIGIN_SNI_LIST[0],test_path=ORIGIN_SPEED_TEST_PATH, timeout=100)
         if not res['success']:
             log("WARN", f"FULL SPEED {each['real_ip']} probe failed, skip")
             continue
@@ -1104,10 +1107,10 @@ def _rank_by_speed(results):
     log("INFO", f"_rank_by_speed: {len(speed_tested)} tested, {passed} passed (>= {LOWEST_SPEED}KB/s), scored by speed rank")
 
 
-def _run_probe_phases(ip_source_list, results, allow_early_stop=True):
+def _run_probe_phases(ip_source_list, results, allow_early_stop=True, do_incremental_speed_test=True):
     """
     只探测 IP 列表，每个 (ip, source_url) 作为一个独立任务。
-    每完成 100 个 IP 的延迟测试后，触发一次增量批次测速。
+    每完成 100 个 IP 的延迟测试后，触发一次增量批次测速（仅 do_incremental_speed_test=True 时）。
     如果早停标志被设置（且 allow_early_stop=True），则不再投递剩余任务并提前结束。
     """
     total = len(ip_source_list)
@@ -1153,10 +1156,9 @@ def _run_probe_phases(ip_source_list, results, allow_early_stop=True):
         while _done_cnt[0] < expected_done and (not allow_early_stop or not _early_stop_flag[0]):
             time.sleep(0.1)
 
-        # 触发本批次的增量测速（只在有新完成的 IP 时）
-        if _done_cnt[0] > last_batch_done and len(results) > 0:
-            incremental_batch_speed_test(results, batch_size=batch_size, target_pass_total=20,
-                                         allow_early_stop=allow_early_stop)
+        # 触发本批次的增量测速（只在有新完成的 IP 时，且 do_incremental_speed_test=True）
+        if do_incremental_speed_test and _done_cnt[0] > last_batch_done and len(results) > 0:
+            incremental_batch_speed_test(results, batch_size=batch_size, target_pass_total=20, allow_early_stop=allow_early_stop)
             last_batch_done = _done_cnt[0]
 
     # 等队列清空
@@ -1227,17 +1229,20 @@ def main():
 
     # Phase 1: 优先级 IP 探测（禁用早停）
     if priority_ips:
-        _run_probe_phases(priority_ips, results, allow_early_stop=False)
+        _run_probe_phases(priority_ips, results, allow_early_stop=False, do_incremental_speed_test=False)
         log("INFO", f"Phase-1 done: {len(results)} valid results")
 
         # Phase 1 全量测速
         _full_batch_speed_test(results)
         log("INFO", f"Phase-1 speed test done")
 
-    # Phase 2: 其余 IP 探测（启用早停）
+    # Phase 2: 其余 IP 探测（启用早停），Phase-1 达标数够则跳过
     if remaining_ips:
-        _run_probe_phases(remaining_ips, results, allow_early_stop=True)
-        log("INFO", f"Phase-2 done: {len(results)} valid results")
+        passed_after_p1 = sum(1 for r in results if r.get('download_speed', 0) >= LOWEST_SPEED)
+        if passed_after_p1 >= 20:
+            _run_probe_phases(remaining_ips, results, allow_early_stop=True, do_incremental_speed_test=False)
+        else:
+            _run_probe_phases(remaining_ips, results, allow_early_stop=True, do_incremental_speed_test=True)
 
     # 统一速度排名赋分
     _rank_by_speed(results)
