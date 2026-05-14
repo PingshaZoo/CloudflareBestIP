@@ -1076,7 +1076,7 @@ def _full_batch_speed_test(results):
         tested_count += 1
 
         log("INFO", f"FULL SPEED colo={each['colo']} ip={each['real_ip']} "
-                     f"download_speed={each['download_speed']}KB/S lat={each['lat']}ms")
+                     f"download_speed={each['download_speed']}KB/S lat={each['lat']}ms download_cost_time={each['download_cost_time']}ms")
 
     passed = sum(1 for r in results if r.get('download_speed', 0) >= LOWEST_SPEED)
     log("INFO", f"_full_batch_speed_test done: {tested_count} tested, {passed} passed (>= {LOWEST_SPEED}KB/s)")
@@ -1098,7 +1098,7 @@ def _rank_by_speed(results):
     speed_tested.sort(key=lambda x: x['download_speed'], reverse=True)
 
     for rank, r in enumerate(speed_tested, start=1):
-        if r['download_speed'] >= (0.6*LOWEST_SPEED):
+        if r['download_speed'] >= (0.8*LOWEST_SPEED):
             r['score'] = rank
         else:
             r['score'] = 9999
