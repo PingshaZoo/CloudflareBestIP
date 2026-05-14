@@ -670,10 +670,10 @@ def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
             if (time.perf_counter() - t_speed_test_0)>=5 :
                 costTime=time.perf_counter() - t_speed_test_0
                 now_speed = round((data_length / 1024) / (time.perf_counter() - t_speed_test_0), 1)
-                if now_speed > (LOWEST_SPEED):
+                if now_speed > (LOWEST_SPEED*1.1):
                     break
-                if now_speed < (LOWEST_SPEED*0.4):
-                    log("INFO", f"ip={ip} costTime={costTime}, speed={now_speed}KB/s < {LOWEST_SPEED*0.4}KB/s — discard!")
+                if now_speed < (LOWEST_SPEED*0.6):
+                    log("INFO", f"ip={ip} costTime={costTime}, speed={now_speed}KB/s < {LOWEST_SPEED*0.6}KB/s — discard!")
                     break
             # 10S 强制结束
             if (time.perf_counter() - t_speed_test_0)>=10:
@@ -1098,13 +1098,13 @@ def _rank_by_speed(results):
     speed_tested.sort(key=lambda x: x['download_speed'], reverse=True)
 
     for rank, r in enumerate(speed_tested, start=1):
-        if r['download_speed'] >= LOWEST_SPEED:
+        if r['download_speed'] >= (0.6*LOWEST_SPEED):
             r['score'] = rank
         else:
             r['score'] = 9999
 
     passed = sum(1 for r in speed_tested if r['score'] != 9999)
-    log("INFO", f"_rank_by_speed: {len(speed_tested)} tested, {passed} passed (>= {LOWEST_SPEED}KB/s), scored by speed rank")
+    log("INFO", f"_rank_by_speed: {len(speed_tested)} tested, {passed} passed (>= {0.6*LOWEST_SPEED}KB/s), scored by speed rank")
 
 
 def _run_probe_phases(ip_source_list, results, allow_early_stop=True, do_incremental_speed_test=True):
@@ -1196,7 +1196,7 @@ def main():
     log("INFO", f"Priority-3 (DOMAINS_SET_URL): {len(domain_ip_sources)} IPs from DNS resolution")
 
     # 4. 按历史测速成绩分组：speed >= LOWEST_SPEED*0.5 的 IP 进入 Phase 1
-    speed_threshold = LOWEST_SPEED * 0.5
+    speed_threshold = LOWEST_SPEED * 0.65
     priority_ips = [(ip, url) for ip, url, speed in have_post_res_list if speed >= speed_threshold]
     log("INFO", f"Phase-1 priority IPs (speed >= {speed_threshold}KB/s): {len(priority_ips)}")
 
