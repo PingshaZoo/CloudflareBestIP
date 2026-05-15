@@ -599,7 +599,7 @@ def fetch_colo_from_trace(ip, domain="la.pingshaisland.top", timeout=10):
             try: sock.close()
             except OSError: pass
 
-def probe_full_path(ip, domain, test_path="/test.bin", timeout=5):
+def probe_full_path(ip, domain, test_path="/test.bin", timeout=3):
     """全链路延迟测量：本地 → CF边缘 → VPS回源"""
     res = {'success': False, 'ttfb_ms': None, 'tcp_ms': None, 'tls_ms': None, 'total_ms': None, 'colo': None, 'error': None}
     t_start = time.perf_counter()
@@ -999,9 +999,9 @@ def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20, 
     with _batch_lock:
         # 从当前结果中选取三区域各 Top5
         try:
-            na_top = top_region(results, region="NorthAmerica", topN=8)
+            na_top = top_region(results, region="NorthAmerica", topN=5)
             hk_top = top_region(results, colo="HKG", topN=5)
-            ea_top = top_region(results, region="EastAsia", topN=2)
+            ea_top = top_region(results, region="EastAsia", topN=5)
         except ValueError:
             return 0  # 结果不足
 
@@ -1137,12 +1137,14 @@ def _run_probe_phases(ip_source_list, results, allow_early_stop=True, do_increme
     # 分批投递，每 100 个检查一次是否早停
     batch_size = 100
     idx = 0
-    last_batch_done = 0  # 上批次完成时的 _done_cnt 值
 
     while idx < total:
         if allow_early_stop and _early_stop_flag[0]:
             log("INFO", "Early stop detected, stopping probe...")
             break
+
+        # 记录本批次开始前的 results 长度，用于截取本批次新增的结果
+        prev_results_len = len(results)
 
         # 投递一批
         batch_end = min(idx + batch_size, total)
@@ -1156,10 +1158,10 @@ def _run_probe_phases(ip_source_list, results, allow_early_stop=True, do_increme
         while _done_cnt[0] < expected_done and (not allow_early_stop or not _early_stop_flag[0]):
             time.sleep(0.1)
 
-        # 触发本批次的增量测速（只在有新完成的 IP 时，且 do_incremental_speed_test=True）
-        if do_incremental_speed_test and _done_cnt[0] > last_batch_done and len(results) > 0:
-            incremental_batch_speed_test(results, batch_size=batch_size, target_pass_total=20, allow_early_stop=allow_early_stop)
-            last_batch_done = _done_cnt[0]
+        # 触发本批次的增量测速（只从刚完成的这批 IP 中选 Top5）
+        if do_incremental_speed_test and len(results) > prev_results_len:
+            new_batch_results = results[prev_results_len:]
+            incremental_batch_speed_test(new_batch_results, batch_size=batch_size, target_pass_total=20, allow_early_stop=allow_early_stop)
 
     # 等队列清空
     q.join()
@@ -1252,28 +1254,12 @@ def main():
     # 5. 上报所有探测结果
     post_all_results(results)
 
-    # 6. 最终选优：只从测速达标的 IP 中按速度排名选取
-    speed_confirmed = [r for r in results if r.get('download_speed', 0) >= LOWEST_SPEED]
 
-    if speed_confirmed:
-        log("INFO", f"Final selection: {len(speed_confirmed)} IPs have completed speed test")
-        # 从已测速 IP 中按区域选取
-        top_n_res = (
-            top_region(speed_confirmed, colo="HKG", topN=8) +
-            top_region(speed_confirmed, region="NorthAmerica", topN=8) +
-            top_region(speed_confirmed, region="EastAsia", topN=8)
-        )
-        top_n_res = select_top(top_n_res, 10)
-    else:
-        # 没有 IP 完成测速，回退到所有结果
-        log("WARN", "No IPs have completed speed test, falling back to all results")
-        top_n_res = (
+    top_n_res = (
             top_region(results, colo="HKG", topN=8) +
             top_region(results, region="NorthAmerica", topN=8) +
             top_region(results, region="EastAsia", topN=8)
         )
-        top_n_res = select_top(top_n_res, 10)
-
     print_top_results(top_n_res)
 
     #更改aliyun DNS
