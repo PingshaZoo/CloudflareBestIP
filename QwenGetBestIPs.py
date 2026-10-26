@@ -27,6 +27,10 @@ import concurrent.futures
 from datetime import datetime
 from pathlib import Path
 import ipaddress
+import http.client
+import io
+import math
+from functools import lru_cache
 # ================= 配置导入 =================
 from config import *
 # ================= 路径与文件 =================
@@ -120,17 +124,21 @@ def log(level, msg):
         sys.stdout.flush()
 
 # ================= HTTP 工具（数据源抓取用）=================
-def _http_get(url, timeout=15):
+def _http_get(url, timeout=15, headers=None):
     """HTTP GET 请求：优先 curl，失败回退 urllib；返回响应字节或 None"""
     if HAS_CURL:
         try:
-            r = subprocess.run([CURL_BIN, "-sf", "--max-time", str(timeout), url], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout+3)
+            args = [CURL_BIN, "-sf", "--max-time", str(timeout)]
+            for key, value in (headers or {}).items():
+                args.extend(["-H", f"{key}: {value}"])
+            r = subprocess.run(args + [url], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout+3)
             if r.returncode == 0: return r.stdout
         except Exception: pass
     try:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-        with urllib.request.urlopen(url, timeout=timeout, context=ctx) as resp: return resp.read()
+        req = urllib.request.Request(url, headers=headers or {})
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp: return resp.read()
     except Exception as e:
         log("WARN", f"_http_get failed {url}: {e}"); return None
 
@@ -157,12 +165,12 @@ def _http_post_file(url, payload_str, timeout=15):
                     tmp_path = tmp.name
                 # 执行 curl 命令
                 result = subprocess.run(
-                    [CURL_BIN, "-s", "-X", "POST", url,
+                    [CURL_BIN, "-sf", "--max-time", str(timeout), "-X", "POST", url,
                      "-H", "Content-Type: application/json",
                      "-d", f"@{tmp_path}"],
                     timeout=timeout,
                     capture_output=True,   # 捕获输出以便检查错误
-                    text=True
+                    text=True, encoding="utf-8", errors="replace"
                 )
                 # 检查返回码（curl 非零表示失败）
                 if result.returncode == 0:
@@ -204,7 +212,9 @@ def _http_post_file(url, payload_str, timeout=15):
 
 # ================= 数据源获取 =================
 def fetch_domains(max_retry=5):
-    """从 DOMAINS_SET_URL 拉取域名列表，失败重试 max_retry 次，全部失败则退出进程"""
+    """从 DOMAINS_SET_URL 拉取域名；源不可用时允许其他 IP 来源继续工作。"""
+    if not DOMAINS_SET_URL:
+        return []
     for attempt in range(1, max_retry + 1):
         raw = _http_get(DOMAINS_SET_URL)
         if raw:
@@ -214,7 +224,8 @@ def fetch_domains(max_retry=5):
                     domains = [str(x).strip() for x in data if str(x).strip()]
                     log("INFO", f"GET domains count={len(domains)}"); return domains
             except Exception as e: log("WARN", f"parse domains fail {attempt}: {e}"); time.sleep(2*attempt)
-    log("ERROR", "GET domains failed"); sys.exit(1)
+    log("WARN", "GET domains failed; continuing with other IP sources")
+    return []
 
 def _fetch_single_url_ips(url):
     """从单个 URL 抓取 IP 列表"""
@@ -231,6 +242,12 @@ _cf_ipv4_cidrs = None
 _cf_cidr_lock = threading.Lock()
 
 def fetch_cloudflare_cidrs():
+    """Serialize cache initialization, including API/fallback loading."""
+    with _cf_cidr_lock:
+        return _load_cloudflare_cidrs()
+
+
+def _load_cloudflare_cidrs():
     """
     获取 Cloudflare IPv4 CIDR 列表。
     1. 内存缓存（已加载则直接返回）
@@ -239,9 +256,8 @@ def fetch_cloudflare_cidrs():
     返回 ipaddress.IPv4Network 对象列表。
     """
     global _cf_ipv4_cidrs
-    with _cf_cidr_lock:
-        if _cf_ipv4_cidrs is not None:
-            return _cf_ipv4_cidrs
+    if _cf_ipv4_cidrs is not None:
+        return _cf_ipv4_cidrs
 
     # 尝试调用官方 API，最多 3 次重试
     for attempt in range(1, 4):
@@ -277,18 +293,19 @@ def fetch_cloudflare_cidrs():
         except Exception as e:
             log("ERROR", f"Parse default CF CIDRs failed: {e}")
 
-    log("WARN", "Using empty CF CIDR list - all IPs will pass filter")
-    return []
+    log("ERROR", "No CF CIDRs available; cannot validate candidate IPs")
+    _cf_ipv4_cidrs = []
+    return _cf_ipv4_cidrs
 
 def is_cf_ip(ip_str):
     """
     判断单个 IPv4 地址是否属于 Cloudflare 网段。
     使用标准库 ipaddress 模块进行 CIDR 匹配。
-    如果 CF CIDRs 未加载（缓存为空），返回 True（容错模式）。
+    没有网段规则时不接受未经验证的 IP。
     """
     global _cf_ipv4_cidrs
     if not _cf_ipv4_cidrs:
-        return True  # 无规则即不过滤
+        return False
     try:
         ip = ipaddress.IPv4Address(ip_str)
         return any(ip in cidr for cidr in _cf_ipv4_cidrs)
@@ -297,9 +314,7 @@ def is_cf_ip(ip_str):
 
 def filter_cf_ips(ips_list):
     """
-    并发过滤 IP 列表，只保留 Cloudflare 网段的 IP。
-    使用线程池并行执行 is_cf_ip() 检查，线程数 = CPU 核数 * 2。
-    返回过滤后的 IP 列表。
+    只保留 Cloudflare 网段的 IP，稳定去重。内存中的网段匹配无需线程池。
     """
     if not ips_list:
         return []
@@ -307,18 +322,7 @@ def filter_cf_ips(ips_list):
     # 确保先加载 CIDR 规则（但不会阻塞太久）
     fetch_cloudflare_cidrs()
 
-    max_workers = max(4, os.cpu_count() * 2)
-    filtered = []
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_ip = {executor.submit(is_cf_ip, ip): ip for ip in ips_list}
-        for future in concurrent.futures.as_completed(future_to_ip):
-            ip = future_to_ip[future]
-            try:
-                if future.result():
-                    filtered.append(ip)
-            except Exception:
-                pass  # 忽略单个 IP 的异常，不影响其他 IP
+    filtered = [ip for ip in dict.fromkeys(ips_list) if is_cf_ip(ip)]
 
     log("INFO", f"CF filter: {len(ips_list)} raw -> {len(filtered)} valid CF IPs")
     return filtered
@@ -335,10 +339,18 @@ def _fetch_have_post_res(url):
             return []
         results = []
         for item in data:
+            if not isinstance(item, dict):
+                continue
             ip = item.get("ip")
-            speed = item.get("speed_kb_s", 0)
-            if ip:
-                results.append((ip, url, speed))
+            if not is_ip(ip):
+                continue
+            try:
+                speed = float(item.get("speed_kb_s") or 0)
+            except (ValueError, TypeError):
+                speed = 0
+            if not math.isfinite(speed) or speed < 0:
+                speed = 0
+            results.append((ip, url, speed))
         log("INFO", f"[HAVE_POST_RES] {url} got={len(results)} items")
         return results
     except Exception as e:
@@ -351,11 +363,11 @@ def fetch_have_post_res():
     返回格式：[(ip, source_url, speed_kb_s), ...]
     按 speed_kb_s 降序排列（速度快的在前）。
     """
-    if not HAVE_POST_RES:
-        log("INFO", "HAVE_POST_RES is empty, skip")
+    urls = list(dict.fromkeys(HAVE_POST_RES + POST_URLS))
+    if not urls:
+        log("INFO", "No history URLs, skip")
         return []
 
-    urls = list(set(HAVE_POST_RES+POST_URLS))  # 去重
     all_results = []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(urls), 20)) as executor:
@@ -374,7 +386,8 @@ def fetch_have_post_res():
             ip_best[ip] = (url, speed)
 
     # 转换为列表并按 speed_kb_s 降序排序（没有 speed_kb_s 的排后面）
-    result_list = [(ip, url, speed) for ip, (url, speed) in ip_best.items()]
+    valid_ips = filter_cf_ips(list(ip_best))
+    result_list = [(ip, ip_best[ip][0], ip_best[ip][1]) for ip in valid_ips]
     result_list.sort(key=lambda x: x[2] if x[2] > 0 else float('-inf'), reverse=True)
 
     log("INFO", f"HAVE_POST_RES: raw={len(all_results)}, deduped={len(result_list)} items (sorted by speed_kb_s DESC)")
@@ -384,6 +397,8 @@ def fetch_wetest_ips():
     """并发从所有 IP_SET_URLS 抓取 IPv4 地址，过滤非 Cloudflare 网段，返回 [(ip, source_url), ...]"""
     ip_source = {}  # ip -> source_url
     urls = IP_SET_URLS
+    if not urls:
+        return []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(urls), 30)) as executor:
         future_to_url = {executor.submit(_fetch_single_url_ips, u): u for u in urls}
         for future in concurrent.futures.as_completed(future_to_url):
@@ -408,7 +423,13 @@ def fetch_wetest_ips():
 # ================= DNS 解析 =================
 def is_ip(s):
     """判断字符串是否为合法 IPv4 地址"""
-    return bool(re.match(r"^\d+\.\d+\.\d+\.\d+$", s))
+    if not isinstance(s, str):
+        return False
+    try:
+        ipaddress.IPv4Address(s)
+        return True
+    except ValueError:
+        return False
 
 def _resolve_via_dig(domain):
     """
@@ -473,16 +494,11 @@ def _resolve_via_nslookup(domain):
 
 def _resolve_via_doh(domain, url, name="DoH"):
     """通过 DoH（HTTPS JSON API）解析域名，返回 IPv4 列表（过滤 fake-ip 段）。"""
-    if not HAS_CURL:
-        return []
     try:
-        r = subprocess.run(
-            [CURL_BIN, "-sf", "--max-time", "5", "-H", "accept: application/dns-json", url],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3
-        )
-        if r.returncode != 0:
+        raw = _http_get(url, timeout=5, headers={"accept": "application/dns-json"})
+        if not raw:
             return []
-        data = json.loads(r.stdout.decode())
+        data = json.loads(raw.decode("utf-8"))
         ips = []
         for ans in data.get("Answer", []):
             if ans.get("type") == 1:  # A 记录
@@ -557,25 +573,65 @@ def resolve_domains_concurrent(domains, max_workers=None):
 
 
 # ================= 🔥 核心探测函数（纯Python原生） =================
+@lru_cache(maxsize=2)
+def _ssl_context(verify_cert):
+    """Reuse immutable SSL contexts instead of loading CA roots for every sample."""
+    ctx = ssl.create_default_context()
+    if not verify_cert:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def _create_tls_socket(ip, domain, timeout, verify_cert=False):
     """创建 TLS 连接到 IP:443，返回 (raw_socket, ssl_socket)"""
     sock = socket.create_connection((ip, 443), timeout=timeout)
-    ctx = ssl.create_default_context()
-    if verify_cert:
-        ctx.check_hostname = True; ctx.verify_mode = ssl.CERT_REQUIRED
-    else:
-        ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-    return sock, ctx.wrap_socket(sock, server_hostname=domain)
+    try:
+        return sock, _ssl_context(verify_cert).wrap_socket(sock, server_hostname=domain)
+    except Exception:
+        sock.close()
+        raise
 
-def _recv_until(ssock, stop_markers, max_size=4096):
-    """从 SSL 套接字读取直到所有标记在数据中出现或达到 max_size"""
-    data = b""
-    while len(data) < max_size:
-        chunk = ssock.recv(1024 * 128)
-        if not chunk: break
-        data += chunk
-        if all(m in data for m in stop_markers): break
-    return data
+
+class _ResponseStream(io.RawIOBase):
+    """Time the first received byte and enforce a deadline on every socket read."""
+    def __init__(self, ssock, timeout, started):
+        super().__init__()
+        self.ssock = ssock
+        self.timeout = timeout
+        self.deadline = started + timeout
+        self.first_byte_at = None
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        remaining = self.deadline - time.perf_counter()
+        if remaining <= 0:
+            raise socket.timeout("HTTP response deadline exceeded")
+        self.ssock.settimeout(min(self.timeout, remaining))
+        chunk = self.ssock.recv(len(buffer))
+        if chunk and self.first_byte_at is None:
+            self.first_byte_at = time.perf_counter()
+        buffer[:len(chunk)] = chunk
+        return len(chunk)
+
+    def makefile(self, mode):
+        return io.BufferedReader(self, buffer_size=64 * 1024)
+
+
+def _open_response(ssock, request, timeout):
+    started = time.perf_counter()
+    stream = _ResponseStream(ssock, timeout, started)
+    ssock.settimeout(timeout)
+    ssock.sendall(request)
+    response = http.client.HTTPResponse(stream)
+    try:
+        response.begin()
+    except Exception:
+        response.close()
+        raise
+    return response, stream, started
 
 def _parse_colo(data):
     """从 /cdn-cgi/trace 响应字节中解析 colo 值，未找到返回 None"""
@@ -586,118 +642,123 @@ def _parse_colo(data):
 
 def fetch_colo_from_trace(ip, domain="la.pingshaisland.top", timeout=10):
     """探测 /cdn-cgi/trace 获取 colo（纯网络测量，无缓存）"""
-    sock = None
+    sock = ssock = response = None
     try:
-        sock, ssock = _create_tls_socket(ip, domain, timeout)
-        ssock.send(f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\n\r\n".encode())
-        data = _recv_until(ssock, [b"\r\n\r\n", b"colo="], max_size=4096)
-        return _parse_colo(data)
+        sock, ssock = _create_tls_socket(ip, domain, timeout, ORIGIN_VERIFY_CERT)
+        response, _, _ = _open_response(ssock, _build_request("GET", "/cdn-cgi/trace", domain, "close"), timeout)
+        if response.status == 200:
+            return _parse_colo(response.read(64 * 1024))
     except Exception:
         return None
     finally:
+        if response:
+            response.close()
+        if ssock:
+            ssock.close()
         if sock:
             try: sock.close()
             except OSError: pass
 
 def probe_full_path(ip, domain, test_path="/test.bin", timeout=3):
-    """全链路延迟测量：本地 → CF边缘 → VPS回源"""
-    res = {'success': False, 'ttfb_ms': None, 'tcp_ms': None, 'tls_ms': None, 'total_ms': None, 'colo': None, 'error': None}
+    """Measure TCP/TLS/first-byte latency; download the body only for speed tests."""
+    res = dict(success=False, ttfb_ms=None, tcp_ms=None, tls_ms=None,
+               total_ms=None, colo=None, error=None, download_speed=0,
+               download_bytes=0, download_cost_time=0)
     t_start = time.perf_counter()
-    
-    # 1. TCP
-    t0 = time.perf_counter()
+    sock = ssock = response = None
+    stage = "TCP"
     try:
+        ctx = _ssl_context(ORIGIN_VERIFY_CERT)
+        t0 = time.perf_counter()
         sock = socket.create_connection((ip, 443), timeout=timeout)
         res['tcp_ms'] = round((time.perf_counter() - t0) * 1000, 1)
-    except Exception as e:
-        res['error'] = f"TCP:{e}"
-        log("WARN", f"ip={ip} TCP connect failed: {e}")
-        return res
-
-    # 2. TLS
-    t0 = time.perf_counter()
-    try:
-        ctx = ssl.create_default_context()
-        if ORIGIN_VERIFY_CERT: ctx.check_hostname = True; ctx.verify_mode = ssl.CERT_REQUIRED
-        else: ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-        ssock = ctx.wrap_socket(sock, server_hostname=domain)  # SNI
-        res['tls_ms'] = round((time.perf_counter() - t0) * 1000, 1)
-    except Exception as e:
-        sock.close()
-        res['error'] = f"TLS:{e}"
-        log("WARN", f"ip={ip} TLS handshake failed: {e}")
-        return res
-    
-    # 3. 获取 colo：优先缓存，未命中时才发 /cdn-cgi/trace（不计入延迟测量）
-    with _colo_cache_lock:
-        cached_colo = _colo_cache.get(ip)
-    if cached_colo and cached_colo != "UNKNOWN":
-        res['colo'] = cached_colo
-    else:
-        try:
-            ssock.settimeout(3)
-            ssock.sendall(f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {domain}\r\nConnection: keep-alive\r\n\r\n".encode())
-            trace_data = _recv_until(ssock, [b"\r\n\r\n", b"colo="], max_size=4096)
-            colo = _parse_colo(trace_data)
-            if colo:
-                res['colo'] = colo
-            else:
-                preview = trace_data[:500].decode(errors="ignore").replace("\r\n", "\\n")
-                log("WARN", f"ip={ip} colo missing in response, body preview: {preview}")
-        except socket.timeout:
-            log("WARN", f"ip={ip} colo recv timeout")
-        except Exception as e:
-            log("WARN", f"ip={ip} colo recv failed: {e}")
-
-    # 4. HTTP TTFB（测试文件）
-    req = _build_request("GET", f"{test_path}?t={int(time.time())}", domain, "close",
-                         extra_headers="Upgrade-Insecure-Requests: 1\r\n")
-    try:
-        ssock.settimeout(timeout)
+        stage = "TLS"
         t0 = time.perf_counter()
-        ssock.sendall(req)                      # 发送完整请求
+        ssock = ctx.wrap_socket(sock, server_hostname=domain)
+        res['tls_ms'] = round((time.perf_counter() - t0) * 1000, 1)
+        stage = "HTTP"
+        with _colo_cache_lock:
+            res['colo'] = _colo_cache.get((ip, domain))
+        if not res['colo']:
+            response, _, _ = _open_response(
+                ssock, _build_request("GET", "/cdn-cgi/trace", domain, "keep-alive"), min(timeout, 3))
+            if response.status != 200:
+                raise ValueError(f"trace HTTP {response.status}")
+            trace = response.read(64 * 1024 + 1)
+            res['colo'] = _parse_colo(trace)
+            if len(trace) > 64 * 1024 or not res['colo']:
+                raise ValueError("invalid trace response")
+            should_reconnect = response.will_close
+            response.close()
+            response = None
+            with _colo_cache_lock:
+                _colo_cache[(ip, domain)] = res['colo']
+            if should_reconnect:
+                ssock.close()
+                sock.close()
+                # Some servers close trace connections; measure the new connection.
+                stage = "TCP"
+                res['tcp_ms'] = res['tls_ms'] = None
+                t0 = time.perf_counter()
+                sock = socket.create_connection((ip, 443), timeout=timeout)
+                res['tcp_ms'] = round((time.perf_counter() - t0) * 1000, 1)
+                stage = "TLS"
+                t0 = time.perf_counter()
+                ssock = ctx.wrap_socket(sock, server_hostname=domain)
+                res['tls_ms'] = round((time.perf_counter() - t0) * 1000, 1)
+                stage = "HTTP"
 
-        first_byte = ssock.recv(1)  # TTFB 关键点
-        if not first_byte: raise Exception("No response")
-        t_speed_test_0 = time.perf_counter()
-        data = first_byte + ssock.recv(1024 * 128)
-        data_length = len(data)
-        while True:
-            chunk = ssock.recv(1024*64)
-            if not chunk: break
-            data_length = data_length+len(chunk)
-            # 5S 强制结束条件
-            if (time.perf_counter() - t_speed_test_0)>=5 :
-                costTime=time.perf_counter() - t_speed_test_0
-                now_speed = round((data_length / 1024) / (time.perf_counter() - t_speed_test_0), 1)
-                if now_speed > (LOWEST_SPEED*1.1):
+        measure_speed = test_path == ORIGIN_SPEED_TEST_PATH
+        response_timeout = min(timeout, 10) if measure_speed else timeout
+        separator = "&" if "?" in test_path else "?"
+        request = _build_request("GET", f"{test_path}{separator}t={time.time_ns()}", domain, "close",
+                                 extra_headers="Cache-Control: no-cache, no-store\r\n")
+        response, stream, started = _open_response(ssock, request, response_timeout)
+        res['ttfb_ms'] = round((stream.first_byte_at - started) * 1000, 1)
+        if response.status != 200:
+            raise ValueError(f"HTTP {response.status}")
+        if measure_speed:
+            if response.getheader("Content-Encoding", "identity").lower() != "identity":
+                raise ValueError("compressed speed test response")
+            body_size = 0
+            expected_size = response.length
+            while True:
+                try:
+                    chunk = response.read1(64 * 1024)
+                except socket.timeout:
+                    if body_size and time.perf_counter() >= stream.deadline:
+                        break  # A bounded sample need not download the entire file.
+                    raise
+                if not chunk:
+                    if expected_size is not None and body_size < expected_size:
+                        raise ValueError("truncated response body")
                     break
-                if now_speed < (LOWEST_SPEED*0.6):
-                    log("INFO", f"ip={ip} costTime={costTime}, speed={now_speed}KB/s < {LOWEST_SPEED*0.6}KB/s — discard!")
+                body_size += len(chunk)
+                elapsed = time.perf_counter() - started
+                if elapsed >= response_timeout:
                     break
-            # 10S 强制结束
-            if (time.perf_counter() - t_speed_test_0)>=10:
-                break
-
-        # 记录实际下载速度（与 now_speed 同样计算公式：实际字节数 / 实际耗时）
-        download_time = time.perf_counter() - t_speed_test_0
-        res['download_speed'] = round((data_length / 1024) / download_time, 1) if download_time > 0 else 0
-
-        status_line = data.split(b"\r\n")[0].decode(errors="ignore")
-        res['ttfb_ms'] = round((time.perf_counter() - t0) * 1000, 1)
-        res['success'] = " 200 " in status_line or " 3" in status_line[:50]
-        res['total_ms'] = round((time.perf_counter() - t_start) * 1000, 1)
-        if not res['success']:
-            log("WARN", f"ip={ip} non-success HTTP status: {status_line.strip()}")
+                if elapsed >= 5:
+                    speed = body_size / 1024 / elapsed
+                    if speed > LOWEST_SPEED * 1.1 or speed < LOWEST_SPEED * 0.6:
+                        break
+            if not body_size:
+                raise ValueError("empty speed test body")
+            elapsed = max(time.perf_counter() - started, 0.000001)
+            res['download_bytes'] = body_size
+            res['download_cost_time'] = round(elapsed * 1000, 1)
+            res['download_speed'] = round(body_size / 1024 / elapsed, 1)
+        res['success'] = True
     except Exception as e:
-        res['error'] = f"HTTP:{e}"
-        log("WARN", f"ip={ip} HTTP request failed: {e}")
+        res['error'] = f"{stage}:{e}"
+        log("WARN", f"ip={ip} {res['error']}")
     finally:
-        try: ssock.unwrap()
-        except (OSError, AttributeError): pass
-        try: sock.shutdown(socket.SHUT_RDWR)
-        except OSError: pass
-        sock.close()
+        res['total_ms'] = round((time.perf_counter() - t_start) * 1000, 1)
+        if response:
+            response.close()
+        if ssock:
+            ssock.close()
+        if sock:
+            sock.close()
     return res
 
 # ================= HTTP 指纹 =================
@@ -705,7 +766,7 @@ _HTTP_FINGERPRINT = (
     "User-Agent:Chrome/128.0.0.0\r\n"
     "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8\r\n"
     "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8\r\n"
-    "Accept-Encoding: gzip, deflate, br\r\n"
+    "Accept-Encoding: identity\r\n"
 )
 
 def _build_request(method, path, host, connection, extra_headers=""):
@@ -740,20 +801,20 @@ def _probe_single_ip(real_ip, target, source_url=None):
             time.sleep(SLEEP_INTERVAL)
             if PROBE_MODE == "full":
                 res = probe_full_path(real_ip, sni, test_path=ORIGIN_TEST_PATH, timeout=TIMEOUT)
+                tcp_ok += res.get('tcp_ms') is not None
+                tls_ok += res.get('tls_ms') is not None
                 if not res['success']:
                     log("WARN", f"ip={real_ip} probe_full_path failed for {sni}: {res.get('error', 'unknown')}")
                     continue
                 colo = res.get('colo')
                 if colo:
                     with _colo_cache_lock:
-                        _colo_cache[real_ip] = colo
+                        _colo_cache[(real_ip, sni)] = colo
                 if not colo:
                     log("WARN", f"ip={real_ip} colo is UNKNOWN after probe_full_path for {sni}")
                     colo = "UNKNOWN"
                 http_ok += 1
-                tcp_ok += 1
-                tls_ok += 1
-                latency = round(res['tcp_ms']+res['ttfb_ms'],1)
+                latency = round(res['tcp_ms'] + res['tls_ms'] + res['ttfb_ms'], 1)
                 latencies.append(latency)
                 each_probe_info.append(colo+":"+str(latency)+"ms")
                 last_tcp_ms = res.get('tcp_ms', 0)
@@ -762,7 +823,7 @@ def _probe_single_ip(real_ip, target, source_url=None):
                 last_total_ms = res.get('total_ms', 0)
             else:
                 t0 = time.perf_counter()
-                colo = fetch_colo_from_trace(real_ip, sni)
+                colo = fetch_colo_from_trace(real_ip, sni, timeout=TIMEOUT)
                 if not colo:
                     log("WARN", f"ip={real_ip} failed to get colo (edge mode) for {sni}")
                     continue
@@ -773,6 +834,8 @@ def _probe_single_ip(real_ip, target, source_url=None):
                 http_ok += 1
                 each_probe_info.append(colo+":"+str(latency)+"ms")
 
+    if not latencies:
+        return None
     sorted_lat = sorted(latencies)
     trimmed_lat = sorted_lat[:-1] if len(sorted_lat) >= 3 else sorted_lat
     avg_lat = round(sum(trimmed_lat) / len(trimmed_lat), 1) if trimmed_lat else 9999
@@ -783,6 +846,7 @@ def _probe_single_ip(real_ip, target, source_url=None):
 
     if score >= 999999:
         log("WARN", f"ip={real_ip} discarded: tcp_loss={tcp_loss} tls_loss={tls_loss} (score={score})")
+        return None
 
     log("INFO", f'avg_lat={avg_lat}ms ip={real_ip} {each_probe_info}')
 
@@ -820,18 +884,14 @@ def worker(q, results, total, worker_name, allow_early_stop=True):
     """工作线程：从队列取任务探测，保证 task_done() 必定被调用"""
     threading.current_thread().name = worker_name   # 显式命名
     while True:
-        d = None
+        d = q.get()
         try:
-            d = q.get()
             if d is None:
-                # 哨兵：退出前仍要 task_done()
-                q.task_done()
                 log("INFO", f" received STOP signal, exiting")
                 break
 
             # 检查是否已提前终止（仅当 allow_early_stop=True 时检查）
             if allow_early_stop and _early_stop_flag[0]:
-                q.task_done()
                 continue
 
             # 任务可能是 (ip, source_url) 元组或单个 target
@@ -844,22 +904,20 @@ def worker(q, results, total, worker_name, allow_early_stop=True):
             plist = probe_target_full(target, source_url)
 
             with _done_lock:
-                _done_cnt[0] += 1
-                done = _done_cnt[0]
+                results.extend(plist)
                 if not plist:
                     _fail_cnt[0] += 1
-                    log("WARN", f"target={target} produced 0 valid results, fail={_fail_cnt[0]}")
-                for r in plist:
-                    results.append(r)
-                if done % PROG_INTERVAL == 0 or done == total:
-                    log("PROG", f" progress={done}/{total} hits={len(results)} fail={_fail_cnt[0]}")
         except Exception as e:
-            # 捕获一切异常，避免线程崩溃
             log("ERROR", f" worker crashed: {type(e).__name__}: {e}")
-            # 即使崩溃也要标记任务完成（否则队列 join 会死锁）
+            with _done_lock:
+                _fail_cnt[0] += 1
         finally:
             if d is not None:
-                q.task_done()   # 无论成功、失败、None 哨兵，都调用一次 task_done
+                with _done_lock:
+                    _done_cnt[0] += 1
+                    if _done_cnt[0] % PROG_INTERVAL == 0:
+                        log("PROG", f"tested={_done_cnt[0]} hits={len(results)} fail={_fail_cnt[0]}")
+            q.task_done()  # Exactly once, including skipped jobs and sentinels.
 
 def _dedup_by_best_score(results):
     """按 real_ip 去重，同一 IP 多条记录时保留 score 最低的"""
@@ -890,24 +948,24 @@ def print_top_results(top):
     """打印最终优选结果到日志和终端"""
     log("FINAL", "==== FINAL TOP ====")
     for r in top:
-        log("FINAL", f'{r["real_ip"]} (from {r["target"]}) -> {r["colo"]} lat={r["lat"]}ms loss={r["loss"]} score={r["score"]}')
+        log("FINAL", f'{r["real_ip"]} (from {r["target"]}) -> {r["colo"]} lat={r["lat"]}ms loss={r["loss"]} speed={r.get("download_speed", 0)}KB/s score={r["score"]}')
 
 def post_all_results(results):
     """将探测结果转为 JSON 并并发 POST 到所有上报地址（含来源 URL、分层耗时、速度等完整字段）"""
     if not results: return
     nodes = []
     skipped = 0
-    for r in sorted(results, key=lambda x: x.get("score") or 999999):
+    for r in sorted(results, key=lambda x: x.get("score", 999999)):
         ip   = (r.get("real_ip") or "").strip()
         colo = (r.get("colo") or "").strip().upper()
-        score = r.get("score") or 999999
+        score = r.get("score", 999999)
         if not ip:
             skipped += 1
             continue
         if not colo or colo in ("UNKNOWN", "NONE", "NULL"):
             skipped += 1
             continue
-        if not score or score > 9999:
+        if score is None or score >= 9999:
             skipped += 1
             continue
         nodes.append({
@@ -925,6 +983,8 @@ def post_all_results(results):
         })
     if skipped:
         log("INFO", f"post_all_results: skipped {skipped} invalid nodes")
+    if not nodes:
+        return
     log("INFO", f"post_all_results: uploading {len(nodes)} nodes")
     threads = [threading.Thread(target=_http_post_file, args=(u, json.dumps(nodes, ensure_ascii=False, indent=4, sort_keys=True)), daemon=False) for u in POST_URLS]
     for t in threads: t.start()
@@ -985,6 +1045,31 @@ def send_to_aliyunDNS(ip_list, domain, max_retry=ALI_DNS_MAX_RETRY):
             log("WARN", f"AliDNS retry in {sleep_sec}s...")
             time.sleep(sleep_sec)
 
+def _speed_passes(result):
+    """One eligibility rule for early stop, ranking, output and DNS selection."""
+    speed = result.get("download_speed", 0)
+    return (math.isfinite(speed) and speed >= LOWEST_SPEED
+            and is_ip(result.get("real_ip"))
+            and result.get("colo") not in (None, "", "UNKNOWN")
+            and result.get("tcp_loss", 0) <= 0.2
+            and result.get("tls_loss", 0) <= 0.2)
+
+
+def _measure_speed(result):
+    """Measure each IP once; failed samples remain failed rather than being retried implicitly."""
+    if result.get("speed_tested") or result.get("download_speed", 0) > 0:
+        return False
+    result["speed_tested"] = True
+    sample = probe_full_path(result['real_ip'], ORIGIN_SNI_LIST[0],
+                             test_path=ORIGIN_SPEED_TEST_PATH, timeout=10)
+    result['download_speed'] = sample.get('download_speed', 0) if sample['success'] else 0
+    result['download_cost_time'] = sample.get('download_cost_time', 0)
+    if _speed_passes(result):
+        _speed_pass_count[0] += 1
+    log("INFO", f"SPEED ip={result['real_ip']} speed={result['download_speed']}KB/s success={sample['success']}")
+    return sample['success']
+
+
 def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20, allow_early_stop=True):
     """
     增量批次测速：每完成 batch_size 个 IP 延迟测试后，从已完成的结果中选取三区域各 Top5 进行测速。
@@ -997,18 +1082,19 @@ def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20, 
         return 0
 
     with _batch_lock:
-        # 从当前结果中选取三区域各 Top5
+        candidates = [r for r in results if not r.get('speed_tested') and not r.get('download_speed', 0)]
+        # 从本批未测速的结果中选取三区域各 Top5，其余区域补足到 15 个。
         try:
-            na_top = top_region(results, region="NorthAmerica", topN=5)
-            hk_top = top_region(results, colo="HKG", topN=5)
-            ea_top = top_region(results, region="EastAsia", topN=5)
+            na_top = top_region(candidates, region="NorthAmerica", topN=5)
+            hk_top = top_region(candidates, colo="HKG", topN=5)
+            ea_top = top_region(candidates, region="EastAsia", topN=5)
         except ValueError:
             return 0  # 结果不足
 
         # 合并去重（避免同一 IP 出现在多个区域被重复测速）
         tested_ips = set()
         batch_to_test = []
-        for r in na_top + hk_top + ea_top:
+        for r in na_top + hk_top + ea_top + select_top(candidates, 15):
             if r['real_ip'] not in tested_ips:
                 tested_ips.add(r['real_ip'])
                 batch_to_test.append(r)
@@ -1020,24 +1106,11 @@ def incremental_batch_speed_test(results, batch_size=100, target_pass_total=20, 
 
         # 对这批 IP 进行测速
         local_pass = 0
-        for each in batch_to_test:
-            if _early_stop_flag[0]:
+        for each in batch_to_test[:15]:
+            if allow_early_stop and _speed_pass_count[0] >= target_pass_total:
                 break
-
-            res = probe_full_path(each['real_ip'], ORIGIN_SNI_LIST[0], test_path=ORIGIN_SPEED_TEST_PATH, timeout=100)
-            if not res['success']:
-                continue
-
-            # 用 probe_full_path 内部已计算的 download_speed（实际字节/实际耗时）
-            each['download_speed'] = res['download_speed']
-            each['download_cost_time'] = round(res['ttfb_ms'], 1)
-            download_speed = each['download_speed']
-
-            log("INFO", f"BATCH colo={each['colo']} ip={each['real_ip']} download_speed={each['download_speed']}KB/S lat={each['lat']}ms")
-
-            if download_speed > LOWEST_SPEED:
+            if _measure_speed(each) and _speed_passes(each):
                 local_pass += 1
-                _speed_pass_count[0] += 1
                 log("INFO", f"BATCH speed PASS: {_speed_pass_count[0]}/{target_pass_total}")
 
         # 检查是否已达到总目标（仅 allow_early_stop=True 时设置早停标志）
@@ -1064,21 +1137,10 @@ def _full_batch_speed_test(results):
     log("INFO", f"=== Full batch speed test: {len(results)} IPs ===")
     tested_count = 0
 
-    for each in results:
-        res = probe_full_path(each['real_ip'], ORIGIN_SNI_LIST[0],test_path=ORIGIN_SPEED_TEST_PATH, timeout=100)
-        if not res['success']:
-            log("WARN", f"FULL SPEED {each['real_ip']} probe failed, skip")
-            continue
+    for each in _dedup_by_best_score(results):
+        tested_count += bool(_measure_speed(each))
 
-        # 用 probe_full_path 内部已计算的 download_speed（实际字节/实际耗时）
-        each['download_speed'] = res['download_speed']
-        each['download_cost_time'] = round(res['tcp_ms'] + res['ttfb_ms'], 1)
-        tested_count += 1
-
-        log("INFO", f"FULL SPEED colo={each['colo']} ip={each['real_ip']} "
-                     f"download_speed={each['download_speed']}KB/S lat={each['lat']}ms download_cost_time={each['download_cost_time']}ms")
-
-    passed = sum(1 for r in results if r.get('download_speed', 0) >= LOWEST_SPEED)
+    passed = sum(_speed_passes(r) for r in results)
     log("INFO", f"_full_batch_speed_test done: {tested_count} tested, {passed} passed (>= {LOWEST_SPEED}KB/s)")
     return tested_count
 
@@ -1088,23 +1150,18 @@ def _rank_by_speed(results):
     最终速度排名：对已完成测速的 IP，按 download_speed 降序排名赋分。
     - 测速达标 (>= LOWEST_SPEED)：score = 排名序号（1, 2, 3...）
     - 测速不达标 (< LOWEST_SPEED)：score = 9999 垫底
-    - 未测速：保持原有的延迟+丢包 score 不变
+    - 未测速/测速失败：score = 9999，不参与最终 TOP/DNS
     """
-    speed_tested = [r for r in results if r.get('download_speed', 0) > 0]
-    if not speed_tested:
-        return
-
-    # 按 download_speed 降序排序
-    speed_tested.sort(key=lambda x: x['download_speed'], reverse=True)
-
-    for rank, r in enumerate(speed_tested, start=1):
-        if r['download_speed'] >= (0.8*LOWEST_SPEED):
-            r['score'] = rank
+    results.sort(key=lambda r: (not _speed_passes(r), -r.get('download_speed', 0), r['lat'], r['real_ip']))
+    passed = 0
+    for r in results:
+        r['probe_score'] = r.get('probe_score', r['score'])
+        if _speed_passes(r):
+            passed += 1
+            r['score'] = passed
         else:
             r['score'] = 9999
-
-    passed = sum(1 for r in speed_tested if r['score'] != 9999)
-    log("INFO", f"_rank_by_speed: {len(speed_tested)} tested, {passed} passed (>= {0.6*LOWEST_SPEED}KB/s), scored by speed rank")
+    log("INFO", f"_rank_by_speed: {passed} passed (>= {LOWEST_SPEED}KB/s)")
 
 
 def _run_probe_phases(ip_source_list, results, allow_early_stop=True, do_incremental_speed_test=True):
@@ -1138,66 +1195,79 @@ def _run_probe_phases(ip_source_list, results, allow_early_stop=True, do_increme
     batch_size = 100
     idx = 0
 
-    while idx < total:
-        if allow_early_stop and _early_stop_flag[0]:
-            log("INFO", "Early stop detected, stopping probe...")
-            break
-
-        # 记录本批次开始前的 results 长度，用于截取本批次新增的结果
-        prev_results_len = len(results)
-
-        # 投递一批
-        batch_end = min(idx + batch_size, total)
-        for i in range(idx, batch_end):
-            q.put(ip_source_list[i])  # (ip, source_url) 元组
-
-        idx = batch_end
-
-        # 等待这批完成：通过检查 _done_cnt 直到达到预期值
-        expected_done = batch_end
-        while _done_cnt[0] < expected_done and (not allow_early_stop or not _early_stop_flag[0]):
-            time.sleep(0.1)
-
-        # 触发本批次的增量测速（只从刚完成的这批 IP 中选 Top5）
-        if do_incremental_speed_test and len(results) > prev_results_len:
-            new_batch_results = results[prev_results_len:]
-            incremental_batch_speed_test(new_batch_results, batch_size=batch_size, target_pass_total=20, allow_early_stop=allow_early_stop)
-
-    # 等队列清空
-    q.join()
+    try:
+        while idx < total:
+            if allow_early_stop and _early_stop_flag[0]:
+                log("INFO", "Early stop detected, stopping probe...")
+                break
+            prev_results_len = len(results)
+            batch_end = min(idx + batch_size, total)
+            for i in range(idx, batch_end):
+                q.put(ip_source_list[i])
+            idx = batch_end
+            q.join()  # Per-batch barrier; independent of previous phases and failures.
+            if do_incremental_speed_test and len(results) > prev_results_len:
+                incremental_batch_speed_test(results[prev_results_len:], batch_size=batch_size,
+                                             target_pass_total=20, allow_early_stop=allow_early_stop)
+    finally:
+        for _ in ts:
+            q.put(None)
+        q.join()
+        for t in ts:
+            t.join()
     log("INFO", "==== Probing DONE ====")
-
-    # 发送停止信号
-    for _ in ts:
-        q.put(None)
-    for t in ts:
-        t.join()
 
     # _rank_by_speed 已移至 main() 统一调用
 
+def _validate_config():
+    if PROBE_MODE not in ("full", "edge"):
+        raise ValueError('PROBE_MODE must be "full" or "edge"')
+    if not ORIGIN_SNI_LIST or any(not isinstance(s, str) or not s.strip() for s in ORIGIN_SNI_LIST):
+        raise ValueError("ORIGIN_SNI_LIST must contain valid hostnames")
+    for path in (ORIGIN_TEST_PATH, ORIGIN_SPEED_TEST_PATH):
+        if not isinstance(path, str) or not path.startswith("/") or "\r" in path or "\n" in path:
+            raise ValueError("Origin test paths must start with / and contain no newlines")
+    for name, value in (("PROBE_REPEAT", PROBE_REPEAT), ("TOP_N", TOP_N), ("PROG_INTERVAL", PROG_INTERVAL)):
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if TIMEOUT <= 0 or LOWEST_SPEED <= 0 or SLEEP_INTERVAL < 0:
+        raise ValueError("TIMEOUT/LOWEST_SPEED must be positive; SLEEP_INTERVAL cannot be negative")
+
+
+def _reset_run_state():
+    _done_cnt[0] = _fail_cnt[0] = _speed_pass_count[0] = 0
+    _early_stop_flag[0] = False
+    with _tested_ips_lock:
+        _tested_ips.clear()
+    with _colo_cache_lock:
+        _colo_cache.clear()
+
+
 def main():
     """主入口：拉取数据源 → 两阶段探测 → 速度复测 → 上报 → 可选同步阿里云 DNS"""
-    # 启动前校验 full 模式配置
-    if not ORIGIN_SNI_LIST or not ORIGIN_TEST_PATH:
-        log("ERROR", "ORIGIN_SNI_LIST 和 ORIGIN_TEST_PATH 不能为空！请检查脚本顶部配置。")
-        sys.exit(1)
+    _validate_config()
+    _reset_run_state()
     log("INFO", f"mode={PROBE_MODE} SNI={ORIGIN_SNI_LIST} path={ORIGIN_TEST_PATH} verify={ORIGIN_VERIFY_CERT}")
 
     # 1. 获取历史优结果 (HAVE_POST_RES) - 优先级最高
-    have_post_res_list = fetch_have_post_res()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        history_task = executor.submit(fetch_have_post_res)
+        wetest_task = executor.submit(fetch_wetest_ips)
+        domains_task = executor.submit(fetch_domains)
+        have_post_res_list = history_task.result()
+        wetest_ip_sources = wetest_task.result()
+        domains = domains_task.result()
     log("INFO", f"HAVE_POST_RES: {len(have_post_res_list)} items fetched")
 
     # 2. 获取第三方 IP (IP_SET_URLS) - 优先级中等
-    wetest_ip_sources = fetch_wetest_ips()
     log("INFO", f"Priority-2 (IP_SET_URLS): {len(wetest_ip_sources)} IPs to probe")
 
     # 3. 获取域名列表并解析 DNS (DOMAINS_SET_URL) - 优先级最低
-    domains = fetch_domains()
     domains = list(dict.fromkeys(domains))
     domain_ip_sources = resolve_domains_concurrent(domains, max_workers=40)
     log("INFO", f"Priority-3 (DOMAINS_SET_URL): {len(domain_ip_sources)} IPs from DNS resolution")
 
-    # 4. 按历史测速成绩分组：speed >= LOWEST_SPEED*0.5 的 IP 进入 Phase 1
+    # 4. 历史速度达到当前下限的 65% 时优先复测；最终达标仍须达到完整下限。
     speed_threshold = LOWEST_SPEED * 0.65
     priority_ips = [(ip, url) for ip, url, speed in have_post_res_list if speed >= speed_threshold]
     log("INFO", f"Phase-1 priority IPs (speed >= {speed_threshold}KB/s): {len(priority_ips)}")
@@ -1240,27 +1310,26 @@ def main():
 
     # Phase 2: 其余 IP 探测（启用早停），Phase-1 达标数够则跳过
     if remaining_ips:
-        passed_after_p1 = sum(1 for r in results if r.get('download_speed', 0) >= LOWEST_SPEED)
+        passed_after_p1 = sum(_speed_passes(r) for r in results)
         if passed_after_p1 >= 20:
-            _run_probe_phases(remaining_ips, results, allow_early_stop=True, do_incremental_speed_test=False)
+            log("INFO", f"Phase-1 already has {passed_after_p1} qualified IPs; skipping Phase-2")
         else:
             _run_probe_phases(remaining_ips, results, allow_early_stop=True, do_incremental_speed_test=True)
 
     # 统一速度排名赋分
     _rank_by_speed(results)
 
-    log("INFO", f"Total IPs probed={len(priority_ips) + len(remaining_ips)} valid={len(results)} fail={_fail_cnt[0]}")
+    log("INFO", f"Total candidates={len(priority_ips) + len(remaining_ips)} tested={_done_cnt[0]} valid={len(results)} fail={_fail_cnt[0]}")
 
     # 5. 上报所有探测结果
     post_all_results(results)
 
 
-    top_n_res = (
-            top_region(results, colo="HKG", topN=8) +
-            top_region(results, region="NorthAmerica", topN=8) +
-            top_region(results, region="EastAsia", topN=8)
-        )
+    top_n_res = select_top([r for r in results if _speed_passes(r)], TOP_N)
     print_top_results(top_n_res)
+    if not top_n_res:
+        log("WARN", f"No IP meets LOWEST_SPEED={LOWEST_SPEED}KB/s; no DNS changes")
+        return
 
     #更改aliyun DNS
     if CHANGE_DNS_RESOLVE:

@@ -50,7 +50,10 @@ python QwenGetBestIPs.py
 
 - 终端实时打印探测进度和最终 TOP 结果
 - 日志写入 `YYYYMMDD_cf_test.log`
-- 命中结果写入 `YYYYMMDD_cf_hits.csv`
+- 最终 TOP 按下载速度排序，仅输出达到 `LOWEST_SPEED` 的节点，数量由 `TOP_N` 控制
+- 离线回归：`python -m unittest discover -s tests -v`（不连接公网、不上报、不修改 DNS）
+
+本轮修复详情见 [脚本审查与回归说明](docs/2026-10-26-script-review.md)。
 
 ## 阿里云 DNS 同步（可选）
 
@@ -90,7 +93,7 @@ DNS 解析域名 -> Cloudflare CIDR 过滤 -> 去重合并 ->
 
 ### 两种探测模式
 
-- **`PROBE_MODE = "full"`**: 同一条 TLS 连接上先请求 `/cdn-cgi/trace` 获取 colo（数据中心代码），再请求 `ORIGIN_TEST_PATH` 测试文件测延迟。返回 TCP/TLS/TTFB 分层耗时。
+- **`PROBE_MODE = "full"`**: 同一条 TLS 连接上先完整读取 `/cdn-cgi/trace` 获取 colo，再请求 `ORIGIN_TEST_PATH`，仅接收响应头并记录首字节延迟。返回 TCP/TLS/TTFB 分层耗时；下载正文仅用于 `ORIGIN_SPEED_TEST_PATH` 速度复测。
 - **`PROBE_MODE = "edge"`**: 仅请求 `/cdn-cgi/trace`，以整体往返时间作为延迟，同时获取 colo。更轻量。
 
 ### 关键函数调用链
@@ -107,8 +110,8 @@ main()
  │       └─ resolve_remote_ip()                   -- DNS 解析链 (DoH->dig/nslookup)
  │       └─ _probe_single_ip()                    -- 单 IP 多次探测 + 打分
  │           ├─ [full] probe_full_path()          -- TCP+TLS+HTTP 全链路
- │           │   ├─ colo 缓存 (_colo_cache)         -- 同 IP 只获取一次
- │           │   └─ 速率检查 (5秒时检查：速度 < LOWEST_SPEED*0.4 丢弃)
+ │           │   ├─ colo 缓存 (_colo_cache)         -- 按 (IP, SNI) 缓存
+ │           │   └─ 首字节测量；仅速度复测下载正文
  │           └─ [edge] fetch_colo_from_trace()    -- 仅 trace 测延迟+colo
  ├─ incremental_batch_speed_test()                -- 增量批次测速 (三区域 Top5)
  ├─ post_all_results()                            -- 并发上报结果到多个 URL
@@ -117,7 +120,7 @@ main()
 
 ### HTTP 指纹
 
-所有出站 HTTP 请求统一使用 Chrome 128 指纹常量 `_HTTP_FINGERPRINT`，通过 `_build_request()` 组装请求头，提高伪装度绕过简单反爬。
+原生探测请求通过 `_build_request()` 组装请求头。测速使用 `Accept-Encoding: identity`，避免压缩影响正文计量；该请求头不改变 Python 的 TLS 指纹。
 
 ### 评分公式
 
@@ -133,10 +136,9 @@ score = avg_lat * WEIGHT_LATENCY + http_loss * LOSS_PENALTY_MS * WEIGHT_LOSS
 **第二阶段（最终排名 `_rank_by_speed`）：**
 - 测速达标 (`download_speed >= LOWEST_SPEED`)：按速度降序排名，**第1名 score=1，第2名 score=2...**
 - 测速不达标 (`download_speed < LOWEST_SPEED`)：score = 9999 垫底
-- 未测速：保持第一阶段延迟+丢包 score 不变
+- 未测速或测速失败：score = 9999，不进入最终 TOP/DNS
 
-最终 `select_top` 按 score 升序选取，速度最快的 IP 天然排在第一位。
-```
+`_rank_by_speed` 原地排序最终列表，`select_top` 只从达标节点中取前 `TOP_N`。早停、排名和最终选优使用同一阈值 `LOWEST_SPEED`。
 
 延迟取 **去尾均值**（去掉最大值），样本数 ≥3 时才去尾，避免单样本变空列表。
 
@@ -155,12 +157,12 @@ score = avg_lat * WEIGHT_LATENCY + http_loss * LOSS_PENALTY_MS * WEIGHT_LOSS
 
 - **IP 优先级探测**: 历史优结果 (`HAVE_POST_RES`) -> 第三方 IP 库 (`IP_SET_URLS`) -> 域名解析 IP (`DOMAINS_SET_URL`)，按优先级顺序投递，同一 IP 优先保留高质量来源
 - **并行数据源拉取**: `fetch_domains()` 和 `fetch_wetest_ips()` 并行执行；IP 源 URL 用 `ThreadPoolExecutor` 并发抓取
-- **colo 缓存**: full 模式下同 IP 只获取一次 colo，写入 `_colo_cache`（edge 模式不缓存，因为 trace 请求本身就是延迟测量）
-- **recv 缓冲区**: 128KB（与测试文件下载量匹配）
+- **colo 缓存**: full 模式按 `(IP, SNI)` 缓存 colo；edge 模式每次实测
+- **recv 缓冲区**: 64KB，使用标准 HTTP 解析器处理正文及 chunked 响应
 - **HTTP 指纹**: 统一使用 Chrome 128 请求头常量 `_HTTP_FINGERPRINT`，通过 `_build_request()` 组装
 - **colo 与延迟同一连接**: `probe_full_path` 在 TLS 握手后先发 trace 拿 colo（keep-alive），再发测试文件请求（close），省掉一次 TCP+TLS
 - **增量批次测速**: 每完成 100 个 IP 延迟测试后触发一次批次测速，从三个区域（NorthAmerica/HKG/EastAsia）各取 Top5 进行速度复测；累计达标 20 个即设置早停标志
-- **动态速率检查**: 测试文件下载时，5 秒时判断当前速度：若 `< LOWEST_SPEED*0.4` 则丢弃，若 `> LOWEST_SPEED` 则提前结束；10 秒强制结束
+- **动态速率检查**: 下载采样 5 秒后，速度 `< LOWEST_SPEED*0.6` 或 `> LOWEST_SPEED*1.1` 时提前结束；HTTP 采样最多 10 秒，每次读取都受剩余时间约束。最终达标仍须达到 `LOWEST_SPEED`。
 
 ### 配置速查
 
@@ -213,7 +215,7 @@ score = avg_lat * WEIGHT_LATENCY + http_loss * LOSS_PENALTY_MS * WEIGHT_LOSS
 ## 修改注意事项
 
 - 改配置项：编辑 `config.py`，新增配置需同步更新 `config.example.py`（脱敏版）
-- 改 `_HTTP_FINGERPRINT` 常量会影响所有出站请求的指纹
-- 改 `probe_full_path` 时注意测试文件下载的速率检查逻辑（5秒时检查：速度 < LOWEST_SPEED*0.4 则丢弃，> LOWEST_SPEED 则提前结束）
-- 线程安全：`_colo_cache`、`_tested_ips`、`_done_cnt`、`_fail_cnt`、`_early_stop_flag`、`_speed_pass_count`、`_batch_lock` 均有独立锁保护
+- 改 `_HTTP_FINGERPRINT` 常量会影响原生探测的 HTTP 请求头，不改变 TLS 指纹
+- 改 `probe_full_path` 时需回归真实 TTFB、正文计量、chunked、截断及截止时间
+- 线程安全：缓存和探测计数通过锁保护；速度复测由调度线程串行执行；每批用 `queue.join()` 等待
 - worker 线程的 `task_done()` 必须在 `finally` 块中调用，否则队列 join 死锁
